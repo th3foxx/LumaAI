@@ -31,9 +31,9 @@ class VoskSettings:
 @dataclass(frozen=True)
 class PiperSettings:
     """Настройки Piper TTS."""
-    model_path: str = os.getenv("PIPER_MODEL_PATH", "models/piper/ru_RU-irina-medium.onnx")
-    config_path: Optional[str] = os.getenv("PIPER_CONFIG_PATH", None)
-    executable: str = os.getenv("PIPER_EXECUTABLE", "piper")
+    model_path: str = os.getenv("PIPER_MODEL_PATH", "./models/piper/ru_RU-irina-medium.onnx")
+    config_path: Optional[str] = os.getenv("PIPER_CONFIG_PATH", "./models/piper/ru_RU-irina-medium.onnx.json")
+    executable: str = os.getenv("PIPER_EXECUTABLE", "./models/piper/piper")
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,8 @@ class AISettings:
     embedding_dims: int = int(os.getenv("EMBED_DIMS", 768))
     grok_model: str = os.getenv("GROK_MODEL", "grok-2-1212")
     temperature: float = float(os.getenv("TEMPERATURE", 0.0))
+    openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 
 
 @dataclass(frozen=True)

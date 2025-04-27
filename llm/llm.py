@@ -2,7 +2,7 @@ from functools import cache
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.embeddings import init_embeddings
-from langchain_xai import ChatXAI
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.postgres import PostgresStore
 from langgraph.prebuilt import ToolNode
@@ -12,7 +12,12 @@ from tools.memory import memory_checkpointer
 from settings import settings
 
 
-llm = ChatXAI(model=settings.ai.grok_model, temperature=settings.ai.temperature)
+llm = ChatOpenAI(
+    openai_api_base=settings.ai.openai_api_base,
+    openai_api_key=settings.ai.openai_api_key,
+    model_name=settings.ai.grok_model,
+    temperature=settings.ai.temperature,
+)
 agent_model = llm.bind_tools(TOOLS)
 
 tool_node = ToolNode(TOOLS)
