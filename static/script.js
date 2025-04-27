@@ -1,19 +1,25 @@
+// --- START OF FILE script.js ---
+
 // --- Configuration ---
 const pageProtocol = window.location.protocol; // Check if page is https: or http:
 const wsProtocol = pageProtocol === 'https:' ? 'wss:' : 'ws:'; // Use wss: if page is https:, otherwise ws:
 const WEBSOCKET_URL = `${wsProtocol}//${window.location.host}/ws/user-${Date.now()}`; // Construct URL dynamically
 const TARGET_SAMPLE_RATE = 16000; // Rate expected by backend (Vosk, Porcupine, Cobra)
 const AUDIO_FRAME_LENGTH = 512; // Samples per chunk sent to backend (matches Porcupine/Cobra)
-const BUFFER_SIZE = 4096; // Audio processing buffer size (adjust if needed)
+// BUFFER_SIZE is no longer directly used for ScriptProcessorNode, but keep concept if needed elsewhere
+// const BUFFER_SIZE = 4096;
+const AUDIO_PROCESSOR_URL = '/static/audio-processor.js';
 
 // --- State ---
 let websocket = null;
 let audioContext = null;
-let audioProcessor = null;
+// let audioProcessor = null; // Replaced by audioWorkletNode
+let audioWorkletNode = null;
 let microphoneStream = null;
 let isRecording = false;
 let currentTTSChunks = []; // Buffer for incoming TTS chunks
 let isBufferingTTS = false; // Flag to indicate if we are collecting TTS chunks
+let isAudioWorkletReady = false; // Flag to track worklet loading
 
 // --- DOM Elements ---
 const statusDiv = document.getElementById('status');
@@ -38,22 +44,59 @@ function concatenateArrayBuffers(buffers) {
     return result.buffer; // Return as ArrayBuffer
 }
 
+// Helper to convert ArrayBuffer/TypedArray to Base64
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    try {
+        return btoa(binary);
+    } catch (e) {
+        // Handle potential InvalidCharacterError if binary string contains chars outside Latin1 range
+        console.error("btoa failed:", e);
+        // Fallback or alternative encoding might be needed if this happens often
+        // For PCM16 data, this should generally not be an issue.
+        return null;
+    }
+}
+
 
 // --- Audio Processing ---
-function createAudioContext() {
+async function createAudioContextAndWorklet() {
+    if (audioContext && isAudioWorkletReady) {
+        return true; // Already initialized
+    }
     if (!audioContext) {
         try {
             window.AudioContext = window.AudioContext || window.webkitAudioContext;
             audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
             console.log(`AudioContext created with sample rate: ${audioContext.sampleRate}`);
             if (audioContext.sampleRate !== TARGET_SAMPLE_RATE) {
-                console.warn(`Requested ${TARGET_SAMPLE_RATE}Hz but got ${audioContext.sampleRate}Hz. Resampling might occur if browser doesn't support target rate.`);
-                // We'll rely on the browser or ScriptProcessorNode to handle this mismatch for now.
-                // For perfect control, AudioWorklet with explicit resampling would be needed.
+                console.warn(`Requested ${TARGET_SAMPLE_RATE}Hz but got ${audioContext.sampleRate}Hz. Input stream constraints are crucial.`);
             }
         } catch (e) {
             console.error("Error creating AudioContext:", e);
             showError("Could not initialize audio processing. Please use a modern browser.");
+            return false;
+        }
+    }
+
+    // Load the Audio Worklet processor
+    if (!isAudioWorkletReady) {
+        try {
+            console.log(`Loading AudioWorklet module from: ${AUDIO_PROCESSOR_URL}`);
+            await audioContext.audioWorklet.addModule(AUDIO_PROCESSOR_URL);
+            console.log("AudioWorklet module loaded successfully.");
+            isAudioWorkletReady = true;
+        } catch (e) {
+            console.error("Error loading AudioWorklet module:", e);
+            showError(`Could not load audio processor: ${e.message}. Check the console and file path.`);
+            // Clean up context if worklet fails? Maybe not, TTS still needs it.
+            // audioContext.close();
+            // audioContext = null;
             return false;
         }
     }
@@ -63,7 +106,7 @@ function createAudioContext() {
 
 async function startAudioProcessing() {
     if (isRecording) return;
-    if (!createAudioContext()) return;
+    if (!await createAudioContextAndWorklet()) return; // Ensure context and worklet are ready
     if (!websocket || websocket.readyState !== WebSocket.OPEN) {
         console.warn("WebSocket not ready, cannot start audio processing.");
         return;
@@ -80,42 +123,30 @@ async function startAudioProcessing() {
                 autoGainControl: true
             }
         });
+        console.log("Microphone access granted.");
 
         const source = audioContext.createMediaStreamSource(microphoneStream);
 
-        // Use ScriptProcessorNode for simplicity (AudioWorklet is preferred for performance)
-        // Adjust bufferSize to influence latency vs. processing load
-        // Frame length needs conversion: bufferSize = frameLength * channels
-        // We want to send chunks matching AUDIO_FRAME_LENGTH
-        // ScriptProcessorNode buffer size must be a power of 2 (e.g., 256, 512, 1024, 2048, 4096, ...)
-        // Choose a size that allows sending chunks of AUDIO_FRAME_LENGTH frequently.
-        // If AUDIO_FRAME_LENGTH is 512, a BUFFER_SIZE of 4096 works well (8 chunks per call).
-        audioProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1); // bufferSize, inputChannels, outputChannels
+        // Create the AudioWorkletNode
+        // The name must match the one registered in audio-processor.js
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-recorder-processor');
+        console.log("AudioWorkletNode created.");
 
-        audioProcessor.onaudioprocess = (event) => {
+        // Handle messages received FROM the AudioWorkletProcessor
+        audioWorkletNode.port.onmessage = (event) => {
             if (!isRecording || !websocket || websocket.readyState !== WebSocket.OPEN) return;
 
-            const inputData = event.inputBuffer.getChannelData(0); // Float32Array [-1.0, 1.0]
+            if (event.data.type === 'audio_data') {
+                // event.data.buffer is the ArrayBuffer containing Int16 PCM data
+                const pcm16Buffer = event.data.buffer;
 
-            // Convert Float32 to Int16 PCM and process in desired frame lengths
-            const samples = inputData.length;
-            for (let i = 0; i < samples; i += AUDIO_FRAME_LENGTH) {
-                const end = Math.min(i + AUDIO_FRAME_LENGTH, samples);
-                const frame = inputData.slice(i, end);
+                // Convert ArrayBuffer to base64
+                const base64String = arrayBufferToBase64(pcm16Buffer);
 
-                if (frame.length === AUDIO_FRAME_LENGTH) { // Only send full frames
-                    const pcm16 = new Int16Array(AUDIO_FRAME_LENGTH);
-                    for (let j = 0; j < AUDIO_FRAME_LENGTH; j++) {
-                        pcm16[j] = Math.max(-32768, Math.min(32767, Math.floor(frame[j] * 32767)));
-                    }
-
-                    // Convert Int16Array buffer to base64
-                    const bufferBytes = pcm16.buffer;
-                    const base64String = btoa(String.fromCharCode(...new Uint8Array(bufferBytes)));
-
+                if (base64String) {
                     // Send audio chunk via WebSocket
                     try {
-                        console.log('send frame', base64String.length);
+                        // console.log(`Sending frame, base64 length: ${base64String.length}`); // Less verbose logging
                         websocket.send(JSON.stringify({
                             type: "audio_chunk",
                             data: base64String
@@ -124,50 +155,86 @@ async function startAudioProcessing() {
                         console.error("Error sending audio chunk:", err);
                         // Handle potential WebSocket closure during sending
                         if (websocket.readyState !== WebSocket.OPEN) {
-                            stopAudioProcessing();
+                            console.warn("WebSocket closed while trying to send audio.");
+                            stopAudioProcessing(); // Stop processing if WS is closed
                         }
                     }
                 } else {
-                    // Handle partial frames if necessary (e.g., buffer them)
-                    // console.log("Partial frame:", frame.length);
+                    console.error("Failed to encode audio buffer to Base64.");
                 }
+            } else {
+                console.warn("Received unknown message type from AudioWorklet:", event.data.type);
             }
         };
 
-        source.connect(audioProcessor);
+        // Connect the microphone source to the worklet node
+        source.connect(audioWorkletNode);
+
+        // Connect the worklet node to the destination to keep the audio graph running.
+        // This is generally required even if you don't want to play the mic audio back.
+        audioWorkletNode.connect(audioContext.destination);
+
+        // Resume context if suspended (e.g., due to browser auto-suspend)
         if (audioContext.state === 'suspended') {
             await audioContext.resume();
             console.log('AudioContext resumed ->', audioContext.state);
         }
-        audioProcessor.connect(audioContext.destination); // Connect to output to avoid issues, though we don't play mic audio
+
+        // Send 'start' command to the worklet
+        audioWorkletNode.port.postMessage({ command: 'start' });
 
         isRecording = true;
-        console.log("Audio processing started.");
+        console.log("Audio processing started using AudioWorklet.");
         // Status might be updated by server message shortly
 
     } catch (err) {
         console.error("Error starting audio processing:", err);
-        showError(`Could not access microphone: ${err.message}. Please grant permission.`);
+        showError(`Could not access microphone or start processing: ${err.message}. Please grant permission.`);
         stopAudioProcessing(); // Clean up if failed
     }
 }
 
 
 function stopAudioProcessing() {
-    if (!isRecording) return;
-    isRecording = false;
-
-    if (audioProcessor) {
-        audioProcessor.disconnect();
-        audioProcessor.onaudioprocess = null; // Remove handler
-        audioProcessor = null;
+    if (!isRecording && !audioWorkletNode) { // Check both flags
+        console.log("Audio processing already stopped or not started.");
+        return;
     }
+    console.log("Stopping audio processing...");
+    isRecording = false; // Set flag immediately
+
+    if (audioWorkletNode) {
+        // Send 'stop' command to the worklet
+        audioWorkletNode.port.postMessage({ command: 'stop' });
+
+        // Clean up message handler to prevent potential memory leaks
+        audioWorkletNode.port.onmessage = null;
+
+        // Disconnect the node from the graph
+        // Note: Disconnecting source first might be slightly cleaner
+        // Assuming 'source' is not accessible here, disconnect the worklet node itself.
+        try {
+             audioWorkletNode.disconnect(); // Disconnects from all outputs (destination)
+             console.log("AudioWorkletNode disconnected.");
+        } catch (e) {
+            console.warn("Error disconnecting AudioWorkletNode:", e);
+        }
+        // Consider explicitly closing the port? Usually not needed.
+        // audioWorkletNode.port.close();
+        audioWorkletNode = null; // Release reference
+    }
+
     if (microphoneStream) {
         microphoneStream.getTracks().forEach(track => track.stop());
+        console.log("Microphone stream stopped.");
         microphoneStream = null;
     }
+
     // Don't close AudioContext here, needed for TTS playback
+    // Don't reset isAudioWorkletReady, the module is still loaded
     console.log("Audio processing stopped.");
+    // Update status explicitly if needed, though server messages usually handle this
+    // updateStatus("Idle", "status-idle");
 }
 
 
@@ -177,29 +244,54 @@ function connectWebSocket() {
     updateStatus("Connecting...", "status-connecting");
     transcriptDiv.textContent = ''; // Clear transcript on reconnect
 
+    // Ensure previous instance is closed before creating a new one
+    if (websocket && websocket.readyState !== WebSocket.CLOSED) {
+        console.warn("Closing existing WebSocket connection before reconnecting.");
+        websocket.close(1000, "Client initiated reconnect"); // 1000 is normal closure
+    }
+    // Defensive nullification
+    websocket = null;
+
+    console.log(`Attempting to connect WebSocket to: ${WEBSOCKET_URL}`);
     websocket = new WebSocket(WEBSOCKET_URL);
 
     websocket.onopen = (event) => {
         console.log("WebSocket connected.");
         // Status will be updated by the first message from the server
         // Start listening immediately after connection
-        startAudioProcessing();
+        // Ensure audio context/worklet is ready before starting processing
+        createAudioContextAndWorklet().then(ready => {
+            if (ready) {
+                startAudioProcessing();
+            } else {
+                showError("Failed to initialize audio system after WebSocket connection.");
+            }
+        });
     };
 
     websocket.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
-            // console.log("WebSocket message received:", message); // Debug
+            // console.log("WebSocket message received:", message.type); // Less verbose
 
             switch (message.type) {
                 case "status":
                     updateStatus(message.message, `status-${message.code.split('_')[0]}`); // e.g., status-wakeword, status-listening
                     // Ensure recording is active when expected
-                    if (message.code === "wakeword_listening" || message.code === "listening_started") {
-                        if (!isRecording) {
-                           console.log("Server expects listening, starting audio processing.");
-                           startAudioProcessing();
-                        }
+                    if ((message.code === "wakeword_listening" || message.code === "listening_started") && !isRecording) {
+                       console.log("Server expects listening, ensuring audio processing is active.");
+                       // Re-check context/worklet readiness before starting
+                       createAudioContextAndWorklet().then(ready => {
+                           if (ready) {
+                               startAudioProcessing();
+                           } else {
+                               showError("Failed to initialize audio system when server requested listening.");
+                           }
+                       });
+                    } else if (message.code === "processing_finished" && isRecording) {
+                        // Optional: Stop recording explicitly if server indicates it's done processing
+                        // console.log("Server finished processing, stopping local recording.");
+                        // stopAudioProcessing();
                     }
                     break;
                 case "transcript":
@@ -226,28 +318,34 @@ function connectWebSocket() {
 
     websocket.onerror = (event) => {
         console.error("WebSocket error:", event);
-        showError("WebSocket connection error. Trying to reconnect...");
+        showError("WebSocket connection error. Check console. Trying to reconnect...");
         // Clean up before attempting reconnect
         stopAudioProcessing();
         if (websocket) {
-            websocket.close(); // Ensure it's closed
-            websocket = null;
+            // Don't set websocket to null here, onclose will handle it
+            websocket.close(); // Ensure it's closed if onerror doesn't trigger onclose
         }
-        // Implement reconnection logic (e.g., exponential backoff)
-        setTimeout(connectWebSocket, 5000); // Simple reconnect after 5 seconds
+        // Reconnection logic moved to onclose for consistency
     };
 
     websocket.onclose = (event) => {
-        console.log("WebSocket closed:", event.code, event.reason);
+        console.log(`WebSocket closed: Code=${event.code}, Reason='${event.reason}', WasClean=${event.wasClean}`);
         stopAudioProcessing(); // Stop mic when disconnected
+
+        // Clear WebSocket reference *after* checking state
+        websocket = null;
+
         if (!event.wasClean) {
-            showError(`WebSocket closed unexpectedly (Code: ${event.code}). Check server logs. Attempting to reconnect...`);
+            showError(`WebSocket closed unexpectedly (Code: ${event.code}). Trying to reconnect...`);
             // Schedule reconnection only if not closed cleanly or intentionally
-             setTimeout(connectWebSocket, 5000);
+             setTimeout(connectWebSocket, 5000); // Simple reconnect after 5 seconds
         } else {
-             updateStatus("Disconnected", "status-error");
+            if (event.code === 1000 && event.reason === "Client initiated reconnect") {
+                 updateStatus("Reconnecting...", "status-connecting"); // Specific status for manual reconnect
+            } else {
+                 updateStatus("Disconnected", "status-error");
+            }
         }
-        websocket = null; // Ensure websocket is nullified
     };
 }
 
@@ -271,12 +369,13 @@ function updateTranscript(text, isFinal) {
 
 function showError(message) {
     errorDiv.textContent = message;
-    console.error(message); // Also log to console
-    // Maybe add a class to highlight the error div
+    errorDiv.style.display = 'block'; // Ensure error div is visible
+    console.error("UI Error:", message); // Also log to console
 }
 
 function clearError() {
     errorDiv.textContent = '';
+    errorDiv.style.display = 'none'; // Hide error div
 }
 
 
@@ -324,6 +423,7 @@ function handleTTSChunk(base64Data, isFinal) {
         if (currentTTSChunks.length > 0) {
             const completeAudioData = concatenateArrayBuffers(currentTTSChunks);
             console.log(`Reassembled TTS audio data: ${completeAudioData.byteLength} bytes`);
+            const chunksToPlay = [...currentTTSChunks]; // Copy buffer before clearing
             currentTTSChunks = []; // Clear the buffer
             playCompleteTTSAudio(completeAudioData); // Play the full audio
         } else {
@@ -335,19 +435,24 @@ function handleTTSChunk(base64Data, isFinal) {
 
 
 async function playCompleteTTSAudio(completeAudioData) {
-    if (!createAudioContext()) { // Ensure context is ready
+    // Use createAudioContextAndWorklet to ensure context exists, but don't need worklet part here
+    if (!await createAudioContextAndWorklet()) {
         console.error("Cannot play TTS, AudioContext not available.");
         showError("Audio playback failed.");
         return;
     }
-     if (completeAudioData.byteLength === 0) {
-        console.warn("Attempted to play empty audio data.");
+     if (!completeAudioData || completeAudioData.byteLength === 0) {
+        console.warn("Attempted to play empty or invalid audio data.");
         return;
     }
 
     try {
         console.log("Decoding complete TTS audio data...");
-        // Decode the *entire* WAV data
+        // Resume context just before decoding/playing, in case it suspended
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+        // Decode the *entire* WAV data (assuming it's WAV or compatible format)
         const audioBuffer = await audioContext.decodeAudioData(completeAudioData);
         console.log(`Successfully decoded audio: Duration ${audioBuffer.duration.toFixed(2)}s`);
 
@@ -373,21 +478,45 @@ async function playCompleteTTSAudio(completeAudioData) {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
+    // Hide error div initially
+    clearError();
+
+    // Check for necessary APIs
+    let supported = true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         showError("Your browser does not support microphone access (getUserMedia). Please use a modern browser like Chrome or Firefox.");
-        updateStatus("Error", "status-error");
-        return;
+        supported = false;
     }
      if (!window.WebSocket) {
         showError("Your browser does not support WebSockets. Please use a modern browser.");
-        updateStatus("Error", "status-error");
-        return;
+        supported = false;
     }
      if (!window.AudioContext && !window.webkitAudioContext) {
          showError("Your browser does not support the Web Audio API. Please use a modern browser.");
-         updateStatus("Error", "status-error");
-         return;
+         supported = false;
+     }
+     // Specifically check for AudioWorklet support
+     if (!window.AudioWorkletNode) {
+        showError("Your browser does not support AudioWorkletNode. Please use a recent version of a modern browser.");
+        supported = false;
      }
 
-    connectWebSocket(); // Start connection on load
+    if (!supported) {
+        updateStatus("Browser Not Supported", "status-error");
+        return; // Stop initialization if essential APIs are missing
+    }
+
+    // Start connection on load if supported
+    connectWebSocket();
 });
+
+// Optional: Add a button or interaction to resume AudioContext if needed
+// document.body.addEventListener('click', async () => {
+//     if (audioContext && audioContext.state === 'suspended') {
+//         console.log("Attempting to resume AudioContext on user interaction...");
+//         await audioContext.resume();
+//         console.log("AudioContext state after resume attempt:", audioContext.state);
+//     }
+// }, { once: true }); // Only need one interaction usually
+
+// --- END OF FILE script.js ---
