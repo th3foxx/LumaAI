@@ -20,6 +20,7 @@ from vosk import Model as VoskModel, KaldiRecognizer
 # Piper TTS (using subprocess)
 import subprocess
 import tempfile
+import math
 
 # Project specific imports
 from settings import settings
@@ -349,19 +350,35 @@ class ConnectionManager:
                     self.states[client_id] = "wakeword"
 
 
+    async def send_tts_chunk(self, client_id: str, audio_chunk_b64: str, is_final_chunk: bool): # Add is_final_chunk
+            if client_id in self.active_connections:
+                websocket = self.active_connections[client_id]
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_json({
+                            "type": "tts_chunk",
+                            "data": audio_chunk_b64,
+                            "is_final": is_final_chunk  # Send the flag
+                        })
+                    except Exception as e:
+                        logger.error(f"Error sending TTS chunk to {client_id}: {e}")
+
+
     async def synthesize_and_send_tts(self, client_id: str, text: str):
         """Synthesizes text using Piper TTS (via subprocess) and streams it."""
         websocket = self.active_connections.get(client_id)
         if not websocket or websocket.client_state != WebSocketState.CONNECTED:
+            logger.warning(f"Client {client_id} disconnected before TTS could be sent.")
             return # Client disconnected
 
+        output_path = None # Ensure output_path is defined for finally block
         try:
             logger.info(f"Starting TTS synthesis for client {client_id}")
             # Use a temporary WAV file for output
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
                 output_path = tmp_wav.name
 
-            # Construct Piper command
+            # Construct Piper command (same as before)
             command = [
                 settings.piper.executable,
                 "--model", settings.piper.model_path,
@@ -369,64 +386,76 @@ class ConnectionManager:
             ]
             if settings.piper.config_path:
                 command.extend(["--config", settings.piper.config_path])
-            # Add other piper flags if needed (e.g., --length_scale, --noise_scale)
 
             logger.debug(f"Running Piper command: {' '.join(command)}")
-
-            # Run Piper process, feeding text via stdin
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, # Capture stdout/stderr for debugging
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-
-            # Write text to piper's stdin and close it
             stdout, stderr = await process.communicate(input=text.encode('utf-8'))
 
             if process.returncode != 0:
                 stderr_output = stderr.decode('utf-8', errors='ignore')
                 raise RuntimeError(f"Piper TTS failed with exit code {process.returncode}: {stderr_output}")
             else:
-                 logger.info(f"Piper TTS synthesis successful. Output: {output_path}")
-                 # Stream the generated WAV file back to the client
-                 # Read the WAV file in chunks and send base64 encoded
-                 chunk_size = 4096 # Send in 4KB chunks
-                 with open(output_path, "rb") as wav_file:
-                      while True:
-                           chunk = wav_file.read(chunk_size)
-                           if not chunk:
-                                break
-                           chunk_b64 = base64.b64encode(chunk).decode('utf-8')
-                           await self.send_tts_chunk(client_id, chunk_b64)
-                           await asyncio.sleep(0.01) # Small sleep to prevent overwhelming the event loop/network
+                logger.info(f"Piper TTS synthesis successful. Output: {output_path}")
 
-                 logger.info(f"Finished sending TTS audio for {client_id}")
+                # --- Modified Chunk Sending Logic ---
+                chunk_size = 4096 # Send in 4KB chunks
+                file_size = os.path.getsize(output_path)
+                total_chunks = math.ceil(file_size / chunk_size)
+                chunks_sent = 0
 
+                with open(output_path, "rb") as wav_file:
+                    while True:
+                        chunk = wav_file.read(chunk_size)
+                        if not chunk:
+                                break # End of file
+
+                        chunks_sent += 1
+                        is_final = (chunks_sent == total_chunks) # Check if this is the last chunk
+
+                        chunk_b64 = base64.b64encode(chunk).decode('utf-8')
+                        # Check connection again before sending
+                        if client_id not in self.active_connections or self.active_connections[client_id].client_state != WebSocketState.CONNECTED:
+                            logger.warning(f"Client {client_id} disconnected during TTS streaming.")
+                            break # Stop sending if client disconnected
+
+                        await self.send_tts_chunk(client_id, chunk_b64, is_final) # Pass the flag
+                        # Add a small sleep ONLY if needed to prevent overwhelming network/client
+                        # await asyncio.sleep(0.005) # Very small delay if needed
+
+                logger.info(f"Finished sending TTS audio ({chunks_sent}/{total_chunks} chunks) for {client_id}")
 
         except FileNotFoundError:
              logger.error(f"Piper executable not found at '{settings.piper.executable}'. Please ensure it's installed and in PATH.")
-             await self.send_error(client_id, "Text-to-Speech engine not found.")
+             # Check connection before sending error
+             if client_id in self.active_connections and self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
+                 await self.send_error(client_id, "Text-to-Speech engine not found.")
         except Exception as e:
             logger.error(f"Piper TTS Error for {client_id}: {e}", exc_info=True)
-            await self.send_error(client_id, f"Text-to-Speech error: {e}")
+            # Check connection before sending error
+            if client_id in self.active_connections and self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
+                await self.send_error(client_id, f"Text-to-Speech error: {e}")
         finally:
-            # Clean up temporary file
-            if 'output_path' in locals() and os.path.exists(output_path):
+            # Clean up temporary file (same as before)
+            if output_path and os.path.exists(output_path):
                 try:
                     os.remove(output_path)
                 except OSError as e:
                     logger.warning(f"Could not remove temporary TTS file {output_path}: {e}")
 
-            # Regardless of TTS success/failure, transition back to wake word listening
-            # Check if client still exists before updating state/sending status
+            # Transition back to wake word listening (same as before)
             if client_id in self.states and client_id in self.active_connections:
-                 logger.info(f"TTS finished for {client_id}, returning to wakeword state.")
+                 logger.info(f"TTS process finished for {client_id}, returning to wakeword state.")
                  self.states[client_id] = "wakeword"
-                 await self.send_status(client_id, "wakeword_listening", "Waiting for wake word...")
+                 # Check connection before sending status
+                 if self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
+                     await self.send_status(client_id, "wakeword_listening", "Waiting for wake word...")
             else:
-                 logger.info(f"Client {client_id} disconnected during or after TTS.")
-
+                 logger.info(f"Client {client_id} disconnected during or after TTS cleanup.")
 
 
 manager = ConnectionManager()

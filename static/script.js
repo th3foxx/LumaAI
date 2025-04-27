@@ -12,13 +12,32 @@ let audioContext = null;
 let audioProcessor = null;
 let microphoneStream = null;
 let isRecording = false;
-let audioQueue = []; // Queue for TTS audio chunks
-let isPlayingTTS = false;
+let currentTTSChunks = []; // Buffer for incoming TTS chunks
+let isBufferingTTS = false; // Flag to indicate if we are collecting TTS chunks
 
 // --- DOM Elements ---
 const statusDiv = document.getElementById('status');
 const transcriptDiv = document.getElementById('transcript');
 const errorDiv = document.getElementById('error');
+
+
+// --- Helper Function ---
+// Function to concatenate multiple ArrayBuffers
+function concatenateArrayBuffers(buffers) {
+    let totalLength = 0;
+    for (const buffer of buffers) {
+        totalLength += buffer.byteLength;
+    }
+
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const buffer of buffers) {
+        result.set(new Uint8Array(buffer), offset);
+        offset += buffer.byteLength;
+    }
+    return result.buffer; // Return as ArrayBuffer
+}
+
 
 // --- Audio Processing ---
 function createAudioContext() {
@@ -40,6 +59,7 @@ function createAudioContext() {
     }
     return true;
 }
+
 
 async function startAudioProcessing() {
     if (isRecording) return;
@@ -132,6 +152,7 @@ async function startAudioProcessing() {
     }
 }
 
+
 function stopAudioProcessing() {
     if (!isRecording) return;
     isRecording = false;
@@ -148,6 +169,7 @@ function stopAudioProcessing() {
     // Don't close AudioContext here, needed for TTS playback
     console.log("Audio processing stopped.");
 }
+
 
 // --- WebSocket Communication ---
 function connectWebSocket() {
@@ -184,7 +206,9 @@ function connectWebSocket() {
                     updateTranscript(message.text, message.is_final);
                     break;
                 case "tts_chunk":
-                    handleTTSChunk(message.data);
+                    // Start buffering if this is the first chunk (implicitly)
+                    isBufferingTTS = true;
+                    handleTTSChunk(message.data, message.is_final); // Pass the flag
                     break;
                 case "error":
                     showError(`Server error: ${message.message}`);
@@ -227,6 +251,7 @@ function connectWebSocket() {
     };
 }
 
+
 // --- UI Updates ---
 function updateStatus(text, cssClass = '') {
     statusDiv.textContent = text;
@@ -243,6 +268,7 @@ function updateTranscript(text, isFinal) {
     }
 }
 
+
 function showError(message) {
     errorDiv.textContent = message;
     console.error(message); // Also log to console
@@ -252,6 +278,7 @@ function showError(message) {
 function clearError() {
     errorDiv.textContent = '';
 }
+
 
 // --- TTS Playback ---
 // Decode Base64 string to ArrayBuffer
@@ -272,59 +299,74 @@ function base64ToArrayBuffer(base64) {
 }
 
 
-async function playNextTTSChunk() {
-    if (isPlayingTTS || audioQueue.length === 0) {
-        return; // Already playing or nothing to play
-    }
-    if (!createAudioContext()) { // Ensure context is ready
-        console.error("Cannot play TTS, AudioContext not available.");
-        audioQueue = []; // Clear queue if context fails
+function handleTTSChunk(base64Data, isFinal) {
+    if (!isBufferingTTS) {
+        console.warn("Received TTS chunk but not in buffering state. Ignoring.");
         return;
     }
 
-    isPlayingTTS = true;
-    const audioData = audioQueue.shift(); // Get the next chunk (ArrayBuffer)
+    const arrayBuffer = base64ToArrayBuffer(base64Data);
+    if (arrayBuffer && arrayBuffer.byteLength > 0) {
+        currentTTSChunks.push(arrayBuffer); // Add chunk to buffer
+    } else if (arrayBuffer && arrayBuffer.byteLength === 0) {
+         console.log("Received empty TTS chunk, ignoring.");
+         // Don't treat an empty chunk as final unless the flag says so
+    } else {
+         console.error("Failed to decode TTS chunk, skipping.");
+         // Decide if this error should stop buffering? Maybe not.
+    }
+
+    // If this is the final chunk, process the complete audio
+    if (isFinal) {
+        console.log(`Received final TTS chunk. Total chunks: ${currentTTSChunks.length}`);
+        isBufferingTTS = false; // Stop buffering state
+
+        if (currentTTSChunks.length > 0) {
+            const completeAudioData = concatenateArrayBuffers(currentTTSChunks);
+            console.log(`Reassembled TTS audio data: ${completeAudioData.byteLength} bytes`);
+            currentTTSChunks = []; // Clear the buffer
+            playCompleteTTSAudio(completeAudioData); // Play the full audio
+        } else {
+            console.warn("Final TTS chunk indicated, but no valid chunks were buffered.");
+            currentTTSChunks = []; // Ensure buffer is clear
+        }
+    }
+}
+
+
+async function playCompleteTTSAudio(completeAudioData) {
+    if (!createAudioContext()) { // Ensure context is ready
+        console.error("Cannot play TTS, AudioContext not available.");
+        showError("Audio playback failed.");
+        return;
+    }
+     if (completeAudioData.byteLength === 0) {
+        console.warn("Attempted to play empty audio data.");
+        return;
+    }
 
     try {
-        // Decode the WAV chunk (assuming server sends WAV)
-        // Note: decodeAudioData decodes the *entire* file format, not just raw PCM.
-        // If server sends raw PCM, we need a different approach (AudioBufferSourceNode with manual buffer filling).
-        // Assuming Piper sends complete WAV chunks or a full WAV file split into chunks.
-        const audioBuffer = await audioContext.decodeAudioData(audioData);
+        console.log("Decoding complete TTS audio data...");
+        // Decode the *entire* WAV data
+        const audioBuffer = await audioContext.decodeAudioData(completeAudioData);
+        console.log(`Successfully decoded audio: Duration ${audioBuffer.duration.toFixed(2)}s`);
 
         const source = audioContext.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioContext.destination);
         source.onended = () => {
-            // console.log("TTS chunk finished playing"); // Debug
-            isPlayingTTS = false;
-            // Immediately try to play the next chunk if available
-            playNextTTSChunk();
+            console.log("TTS playback finished.");
+            // No need to trigger next chunk, playback is complete
         };
         source.start();
-        // console.log("Playing TTS chunk"); // Debug
+        console.log("Starting TTS playback...");
 
     } catch (e) {
-        console.error("Error decoding or playing audio chunk:", e);
-        showError("Error playing assistant response.");
-        isPlayingTTS = false;
-        // Attempt to play the next chunk even if this one failed
-         playNextTTSChunk();
-    }
-}
-
-function handleTTSChunk(base64Data) {
-    const arrayBuffer = base64ToArrayBuffer(base64Data);
-    if (arrayBuffer && arrayBuffer.byteLength > 0) {
-        audioQueue.push(arrayBuffer);
-        // Start playback if not already playing
-        if (!isPlayingTTS) {
-            playNextTTSChunk();
-        }
-    } else if (arrayBuffer && arrayBuffer.byteLength === 0) {
-         console.log("Received empty TTS chunk, ignoring.");
-    } else {
-         console.error("Failed to decode TTS chunk, skipping.");
+        console.error("Error decoding or playing complete TTS audio:", e);
+        showError(`Error playing assistant response: ${e.message}`);
+        // Log the first few bytes if decoding fails, might hint at format issues
+        const firstBytes = new Uint8Array(completeAudioData.slice(0, 12));
+        console.error("First 12 bytes of failed audio data:", firstBytes);
     }
 }
 
@@ -349,13 +391,3 @@ document.addEventListener('DOMContentLoaded', () => {
 
     connectWebSocket(); // Start connection on load
 });
-
-// Optional: Add a button to manually start/stop if needed
-// const toggleButton = document.getElementById('toggleButton');
-// toggleButton.onclick = () => {
-//     if (isRecording) {
-//         stopAudioProcessing();
-//     } else {
-//         startAudioProcessing();
-//     }
-// };
