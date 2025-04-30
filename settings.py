@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from typing import List, Optional
@@ -34,6 +34,33 @@ class PiperSettings:
     model_path: str = os.getenv("PIPER_MODEL_PATH", "./models/piper/ru_RU-irina-medium.onnx")
     config_path: Optional[str] = os.getenv("PIPER_CONFIG_PATH", "./models/piper/ru_RU-irina-medium.onnx.json")
     executable: str = os.getenv("PIPER_EXECUTABLE", "./models/piper/piper")
+
+
+@dataclass(frozen=True)
+class ParoliServerSettings:
+    """Настройки Paroli TTS."""
+    encoder_path: str = os.getenv("PAROLI_ENCODER_PATH", "./models/paroli/models/encoder.onnx")
+    decoder_path: Optional[str] = os.getenv("PAROLI_DECODER_PATH", "./models/paroli/models/decoder.rknn")
+    config_path: Optional[str] = os.getenv("PAROLI_CONFIG_PATH", "./models/paroli/models/model.json")
+    executable: str = os.getenv("PAROLI_EXECUTABLE", "./models/paroli/paroli-server")
+
+    ip: str = os.getenv("PAROLI_IP", "127.0.0.1")
+    port: int = int(os.getenv("PAROLI_PORT", 8848))
+
+    extra_args: List[str] = field(default_factory=list)
+
+    @property
+    def ws_url(self) -> str:
+        """Вычисляет WebSocket URL на основе ip и port."""
+        return f"ws://{self.ip}:{self.port}/api/v1/stream"
+
+    speaker_id: Optional[int] = int(os.getenv("PAROLI_SPEAKER_ID")) if os.getenv("PAROLI_SPEAKER_ID") is not None else None
+    audio_format: str = os.getenv("PAROLI_AUDIO_FORMAT", "pcm")
+    pcm_sample_rate: int = int(os.getenv("PAROLI_PCM_SAMPLE_RATE", 22050))
+
+    length_scale: Optional[float] = float(os.getenv("PAROLI_LENGTH_SCALE")) if os.getenv("PAROLI_LENGTH_SCALE") else None
+    noise_scale: Optional[float] = float(os.getenv("PAROLI_NOISE_SCALE")) if os.getenv("PAROLI_NOISE_SCALE") else None
+    noise_w: Optional[float] = float(os.getenv("PAROLI_NOISE_W")) if os.getenv("PAROLI_NOISE_W") else None
 
 
 @dataclass(frozen=True)
@@ -80,14 +107,15 @@ class AISettings:
 @dataclass(frozen=True)
 class Settings:
     """Главный объект конфигурации приложения."""
-    picovoice: PicovoiceSettings = PicovoiceSettings()
-    vad: VADSettings = VADSettings()
-    vosk: VoskSettings = VoskSettings()
-    piper: PiperSettings = PiperSettings()
-    audio: AudioSettings = AudioSettings()
-    webapp: WebAppSettings = WebAppSettings()
-    postgres: PostgresSettings = PostgresSettings()
-    ai: AISettings = AISettings()
+    picovoice: PicovoiceSettings = field(default_factory=PicovoiceSettings)
+    vad: VADSettings = field(default_factory=VADSettings)
+    vosk: VoskSettings = field(default_factory=VoskSettings)
+    piper: PiperSettings = field(default_factory=PiperSettings)
+    paroli_server: ParoliServerSettings = field(default_factory=ParoliServerSettings)
+    audio: AudioSettings = field(default_factory=AudioSettings)
+    webapp: WebAppSettings = field(default_factory=WebAppSettings)
+    postgres: PostgresSettings = field(default_factory=PostgresSettings)
+    ai: AISettings = field(default_factory=AISettings)
 
 
 # Единая точка доступа к настройкам

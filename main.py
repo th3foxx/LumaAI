@@ -4,8 +4,7 @@ import json
 import logging
 import os
 import struct
-import wave
-import numpy as np
+import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -16,11 +15,6 @@ import pvcobra
 
 # Vosk
 from vosk import Model as VoskModel, KaldiRecognizer
-
-# Piper TTS (using subprocess)
-import subprocess
-import tempfile
-import math
 
 # Project specific imports
 from settings import settings
@@ -34,8 +28,121 @@ logger = logging.getLogger(__name__)
 porcupine = None
 cobra = None
 vosk_model = None
+paroli_server_process = None 
+paroli_log_reader_task = None 
 
 from functools import partial
+
+# --- Paroli Server Management ---
+
+async def read_stream(stream, log_prefix):
+    """Асинхронно читает и логирует вывод из потока (stdout/stderr)."""
+    while True:
+        line = await stream.readline()
+        if line:
+            logger.info(f"[{log_prefix}] {line.decode('utf-8', errors='ignore').strip()}")
+        else:
+            break # Поток закрыт
+
+async def start_paroli_server():
+    """Запускает процесс paroli-server при старте FastAPI."""
+    global paroli_server_process, paroli_log_reader_task
+    if paroli_server_process is not None and paroli_server_process.returncode is None:
+        logger.warning("Paroli server process already seems to be running.")
+        return
+
+    # Проверяем наличие исполняемого файла
+    if not os.path.exists(settings.paroli_server.executable):
+        logger.error(f"Paroli server executable not found at: {settings.paroli_server.executable}")
+        logger.error("TTS will not be available. Please check settings.paroli_server.executable")
+        # raise FileNotFoundError(f"Paroli server executable not found: {settings.paroli_server.executable}")
+        return # Продолжаем без TTS
+
+    # Формируем команду запуска
+    command = [
+        settings.paroli_server.executable,
+        "--encoder", settings.paroli_server.encoder_path,
+        "--decoder", settings.paroli_server.decoder_path,
+        "-c", settings.paroli_server.config_path,
+        "--ip", settings.paroli_server.ip,
+        "--port", str(settings.paroli_server.port),
+    ]
+    # Добавляем дополнительные аргументы, если они есть
+    command.extend(settings.paroli_server.extra_args)
+
+    logger.info(f"Starting paroli-server with command: {' '.join(command)}")
+    try:
+        # Запускаем процесс, перенаправляя stdout и stderr
+        paroli_server_process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logger.info(f"Paroli server process started with PID: {paroli_server_process.pid}")
+
+        # Запускаем задачи для асинхронного чтения логов
+        stdout_task = asyncio.create_task(read_stream(paroli_server_process.stdout, "paroli-stdout"))
+        stderr_task = asyncio.create_task(read_stream(paroli_server_process.stderr, "paroli-stderr"))
+        paroli_log_reader_task = asyncio.gather(stdout_task, stderr_task) # Сохраняем для отмены
+
+        # Даем серверу немного времени на запуск перед тем, как считать его готовым
+        await asyncio.sleep(2.0) # Можно настроить время
+
+        if paroli_server_process.returncode is not None:
+             logger.error(f"Paroli server process exited immediately after start with code: {paroli_server_process.returncode}")
+             paroli_server_process = None # Сбрасываем, так как он не запустился
+             if paroli_log_reader_task:
+                paroli_log_reader_task.cancel() # Отменяем задачи чтения логов
+                paroli_log_reader_task = None
+             # Можно поднять ошибку, чтобы FastAPI не стартовал
+             # raise RuntimeError("Failed to start paroli-server")
+        else:
+             logger.info("Paroli server seems to be running.")
+
+    except FileNotFoundError:
+        logger.error(f"Paroli server executable not found at: {settings.paroli_server.executable}")
+        paroli_server_process = None
+    except Exception as e:
+        logger.error(f"Failed to start paroli-server: {e}", exc_info=True)
+        paroli_server_process = None
+
+async def stop_paroli_server():
+    """Останавливает процесс paroli-server при остановке FastAPI."""
+    global paroli_server_process, paroli_log_reader_task
+    if paroli_log_reader_task:
+        paroli_log_reader_task.cancel() # Отменяем задачи чтения логов
+        try:
+            await paroli_log_reader_task # Ждем завершения отмены
+        except asyncio.CancelledError:
+            pass # Ожидаемое исключение
+        paroli_log_reader_task = None
+        logger.info("Paroli log reader tasks cancelled.")
+
+    if paroli_server_process and paroli_server_process.returncode is None:
+        logger.info(f"Stopping paroli-server process (PID: {paroli_server_process.pid})...")
+        try:
+            paroli_server_process.terminate() # Посылаем SIGTERM (более мягкий)
+            await asyncio.wait_for(paroli_server_process.wait(), timeout=5.0) # Ждем до 5 секунд
+            logger.info("Paroli server process terminated gracefully.")
+        except asyncio.TimeoutError:
+            logger.warning("Paroli server process did not terminate gracefully, killing...")
+            try:
+                paroli_server_process.kill() # Посылаем SIGKILL (жесткий)
+                await paroli_server_process.wait() # Ждем завершения после kill
+                logger.info("Paroli server process killed.")
+            except ProcessLookupError:
+                 logger.warning("Paroli server process already exited before kill.")
+            except Exception as kill_err:
+                logger.error(f"Error killing paroli-server process: {kill_err}")
+        except ProcessLookupError:
+             logger.warning("Paroli server process already exited before terminate.")
+        except Exception as term_err:
+             logger.error(f"Error terminating paroli-server process: {term_err}")
+        finally:
+            paroli_server_process = None
+    else:
+        logger.info("Paroli server process not running or already stopped.")
+
 
 def initialize_resources():
     global porcupine, cobra, vosk_model
@@ -67,6 +174,17 @@ def initialize_resources():
         vosk_model = VoskModel(settings.vosk.model_path)
         logger.info(f"Vosk model loaded from {settings.vosk.model_path}")
 
+
+        # --- Paroli Server Sanity Check (проверка настроек) ---
+        if not settings.paroli_server.executable:
+             logger.warning("Path to paroli-server executable (paroli_server.executable) not set in settings.")
+        if not settings.paroli_server.ws_url:
+             logger.warning("Paroli Server WebSocket URL (paroli_server.ws_url) is missing or incorrect in settings.")
+        if settings.paroli_server.audio_format == "pcm" and not settings.paroli_server.pcm_sample_rate:
+             logger.warning("Paroli Server configured for 'pcm', but pcm_sample_rate not set. Playback may be incorrect.")
+        logger.info(f"Paroli Server configured: Executable={settings.paroli_server.executable}, URL={settings.paroli_server.ws_url}, Format={settings.paroli_server.audio_format}")
+        # --- End Paroli Server Sanity Check ---
+
     except pvporcupine.PorcupineError as e:
         logger.error(f"Porcupine initialization failed: {e}")
         raise
@@ -80,8 +198,8 @@ def initialize_resources():
 # --- FastAPI App ---
 app = FastAPI(
     title="Lumi Voice Assistant",
-    on_startup=[initialize_resources],
-    # Add on_shutdown hook if needed to release resources, though OS usually handles it
+    on_startup=[initialize_resources, start_paroli_server],
+    on_shutdown=[stop_paroli_server],                     
 )
 
 # Mount static files (HTML, JS)
@@ -102,7 +220,7 @@ class ConnectionManager:
         self.states: dict[str, str] = {} # "wakeword", "listening", "processing", "speaking"
         self.audio_buffers: dict[str, bytearray] = {}
         self.silence_frames: dict[str, int] = {} # Count consecutive silent frames for VAD
-        # NEW: Counter for frames processed since listening started
+        # Counter for frames processed since listening started
         self.frames_processed_in_listening: dict[str, int] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
@@ -135,7 +253,7 @@ class ConnectionManager:
             del self.audio_buffers[client_id]
         if client_id in self.silence_frames:
             del self.silence_frames[client_id]
-        # NEW: Clean up frame counter
+        # Clean up frame counter
         if client_id in self.frames_processed_in_listening:
             del self.frames_processed_in_listening[client_id]
         logger.info(f"Client disconnected: {client_id}")
@@ -171,9 +289,24 @@ class ConnectionManager:
             websocket = self.active_connections[client_id]
             if websocket.client_state == WebSocketState.CONNECTED:
                 try:
-                    await websocket.send_json({"type": "tts_chunk", "data": audio_chunk_b64})
+                    await websocket.send_json({
+                        "type": "tts_chunk",
+                        "data": audio_chunk_b64,
+                        "is_final": False # Всегда False, т.к через tts_finished
+                    })
                 except Exception as e:
                      logger.error(f"Error sending TTS chunk to {client_id}: {e}")
+
+    # --- Отправка сигнала об окончании потока TTS ---
+    async def send_tts_finished(self, client_id: str):
+        if client_id in self.active_connections:
+            websocket = self.active_connections[client_id]
+            if websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({"type": "tts_finished"})
+                    logger.info(f"Sent TTS finished signal to {client_id}")
+                except Exception as e:
+                     logger.error(f"Error sending TTS finished signal to {client_id}: {e}")
 
     async def send_error(self, client_id: str, error_message: str):
         if client_id in self.active_connections:
@@ -210,7 +343,7 @@ class ConnectionManager:
 
             # --- State Machine ---
             if state == "wakeword":
-                # --- Wake Word Logic (Same as before) ---
+                # --- Wake Word Logic ---
                 try:
                     if len(pcm) != porcupine.frame_length:
                         logger.error(f"PCM length {len(pcm)} doesn't match Porcupine frame length {porcupine.frame_length}. Skipping wake word check.")
@@ -254,9 +387,6 @@ class ConnectionManager:
                     # Feed the chunk to Vosk
                     vosk_accepted_waveform = vosk_recognizer.AcceptWaveform(audio_chunk)
 
-                    # *** We no longer call Result() here just because AcceptWaveform is True ***
-                    # *** We only care about PartialResult for intermediate feedback ***
-
                     # Get partial result for continuous feedback
                     partial_result_json = vosk_recognizer.PartialResult()
                     partial_result = json.loads(partial_result_json)
@@ -266,7 +396,7 @@ class ConnectionManager:
                         # logger.debug(f"Vosk Partial: {partial_transcript}")
                         await self.send_transcript(client_id, partial_transcript, is_final=False)
 
-                    # --- Process with Cobra VAD (Same as before) ---
+                    # --- Process with Cobra VAD ---
                     is_voiced = False
                     if len(pcm) == cobra.frame_length:
                         voice_probability = cobra.process(pcm)
@@ -275,7 +405,7 @@ class ConnectionManager:
                         logger.warning(f"Audio chunk PCM size {len(pcm)} != Cobra frame length {cobra.frame_length}. VAD disabled for this frame.")
                         is_voiced = False # Assume silence if frame size is wrong
 
-                    # --- VAD Logic (Same as before) ---
+                    # --- VAD Logic ---
                     if not is_voiced:
                         self.silence_frames[client_id] += 1
                     else:
@@ -312,11 +442,11 @@ class ConnectionManager:
                         # Send the definitive final transcript (even if empty)
                         await self.send_transcript(client_id, final_transcript, is_final=True)
 
-                        # --- Transition (Same as before) ---
+                        # --- Transition ---
                         if final_transcript:
                             self.states[client_id] = "processing"
                             await self.send_status(client_id, "processing_started", "Thinking...")
-                            # (LLM and TTS call follows - same as before)
+                            # (LLM and TTS call follows)
                             try:
                                 loop = asyncio.get_running_loop()
                                 func = partial(ask_lumi, final_transcript, thread_id=client_id)
@@ -350,112 +480,134 @@ class ConnectionManager:
                     self.states[client_id] = "wakeword"
 
 
-    async def send_tts_chunk(self, client_id: str, audio_chunk_b64: str, is_final_chunk: bool): # Add is_final_chunk
-            if client_id in self.active_connections:
-                websocket = self.active_connections[client_id]
-                if websocket.client_state == WebSocketState.CONNECTED:
-                    try:
-                        await websocket.send_json({
-                            "type": "tts_chunk",
-                            "data": audio_chunk_b64,
-                            "is_final": is_final_chunk  # Send the flag
-                        })
-                    except Exception as e:
-                        logger.error(f"Error sending TTS chunk to {client_id}: {e}")
-
-
     async def synthesize_and_send_tts(self, client_id: str, text: str):
-        """Synthesizes text using Piper TTS (via subprocess) and streams it."""
-        websocket = self.active_connections.get(client_id)
-        if not websocket or websocket.client_state != WebSocketState.CONNECTED:
+        """Synthesizes text using Paroli Server WebSocket API and streams audio."""
+        browser_websocket = self.active_connections.get(client_id)
+        if not browser_websocket or browser_websocket.client_state != WebSocketState.CONNECTED:
             logger.warning(f"Client {client_id} disconnected before TTS could be sent.")
-            return # Client disconnected
+            return
 
-        output_path = None # Ensure output_path is defined for finally block
+        # Используем async with для автоматического управления соединением
         try:
-            logger.info(f"Starting TTS synthesis for client {client_id}")
-            # Use a temporary WAV file for output
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-                output_path = tmp_wav.name
+            logger.info(f"Connecting to Paroli Server for TTS: {settings.paroli_server.ws_url}")
+            async with websockets.connect(settings.paroli_server.ws_url) as paroli_ws:
+                logger.info(f"Connected to Paroli Server for client {client_id}")
 
-            # Construct Piper command (same as before)
-            command = [
-                settings.piper.executable,
-                "--model", settings.piper.model_path,
-                "--output_file", output_path,
-            ]
-            if settings.piper.config_path:
-                command.extend(["--config", settings.piper.config_path])
+                # Construct request payload
+                request_payload = {
+                    "text": text,
+                    "audio_format": settings.paroli_server.audio_format
+                }
+                # ... (добавление speaker_id и других опций как было) ...
+                if settings.paroli_server.speaker_id is not None: request_payload["speaker_id"] = settings.paroli_server.speaker_id
+                if settings.paroli_server.length_scale is not None: request_payload["length_scale"] = settings.paroli_server.length_scale
+                if settings.paroli_server.noise_scale is not None: request_payload["noise_scale"] = settings.paroli_server.noise_scale
+                if settings.paroli_server.noise_w is not None: request_payload["noise_w"] = settings.paroli_server.noise_w
 
-            logger.debug(f"Running Piper command: {' '.join(command)}")
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate(input=text.encode('utf-8'))
+                request_json = json.dumps(request_payload)
+                logger.debug(f"Sending TTS request to Paroli Server for {client_id}: {request_json}")
+                await paroli_ws.send(request_json)
 
-            if process.returncode != 0:
-                stderr_output = stderr.decode('utf-8', errors='ignore')
-                raise RuntimeError(f"Piper TTS failed with exit code {process.returncode}: {stderr_output}")
-            else:
-                logger.info(f"Piper TTS synthesis successful. Output: {output_path}")
+                # Receive and forward audio chunks
+                chunks_sent_to_browser = 0
+                last_status_ok = False # Флаг для проверки успешного завершения
+                while True:
+                    # Check browser connection before receiving from Paroli
+                    if client_id not in self.active_connections or self.active_connections[client_id].client_state != WebSocketState.CONNECTED:
+                        logger.warning(f"Client {client_id} disconnected during TTS streaming from Paroli.")
+                        break # Stop processing if browser client disconnected
 
-                # --- Modified Chunk Sending Logic ---
-                chunk_size = 4096 # Send in 4KB chunks
-                file_size = os.path.getsize(output_path)
-                total_chunks = math.ceil(file_size / chunk_size)
-                chunks_sent = 0
+                    try:
+                        # Устанавливаем таймаут на получение, чтобы не зависнуть навсегда,
+                        # если Paroli перестанет отвечать без закрытия соединения
+                        message = await asyncio.wait_for(paroli_ws.recv(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout waiting for message from Paroli Server for {client_id}.")
+                        await self.send_error(client_id, "TTS server timed out.")
+                        break
+                    except websockets.exceptions.ConnectionClosedOK:
+                        logger.info(f"Paroli Server closed connection cleanly for {client_id}.")
+                        # Если соединение закрылось до получения "ok", считаем это ошибкой или незавершенным процессом
+                        if not last_status_ok:
+                            logger.warning(f"Paroli connection closed OK before receiving final 'ok' status for {client_id}.")
+                            # Можно отправить ошибку или просто не отправлять tts_finished
+                            await self.send_error(client_id, "TTS stream ended unexpectedly.")
+                        break
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        logger.error(f"Paroli Server connection closed unexpectedly for {client_id}: {e}")
+                        await self.send_error(client_id, f"TTS Server connection error: {e.reason}")
+                        break
+                    except Exception as recv_err: # Ловим другие возможные ошибки при получении
+                        logger.error(f"Error receiving message from Paroli Server for {client_id}: {recv_err}", exc_info=True)
+                        await self.send_error(client_id, f"Error communicating with TTS server.")
+                        break
 
-                with open(output_path, "rb") as wav_file:
-                    while True:
-                        chunk = wav_file.read(chunk_size)
-                        if not chunk:
-                                break # End of file
 
-                        chunks_sent += 1
-                        is_final = (chunks_sent == total_chunks) # Check if this is the last chunk
+                    if isinstance(message, bytes):
+                        # Received binary audio chunk
+                        if len(message) > 0:
+                            audio_chunk_b64 = base64.b64encode(message).decode('utf-8')
+                            await self.send_tts_chunk(client_id, audio_chunk_b64)
+                            chunks_sent_to_browser += 1
+                        else:
+                            logger.warning(f"Received empty audio chunk from Paroli for {client_id}")
 
-                        chunk_b64 = base64.b64encode(chunk).decode('utf-8')
-                        # Check connection again before sending
-                        if client_id not in self.active_connections or self.active_connections[client_id].client_state != WebSocketState.CONNECTED:
-                            logger.warning(f"Client {client_id} disconnected during TTS streaming.")
-                            break # Stop sending if client disconnected
+                    elif isinstance(message, str):
+                        # Received final text status message
+                        logger.info(f"Received final status from Paroli Server for {client_id}: {message}")
+                        try:
+                            status_data = json.loads(message)
+                            if status_data.get("status") == "ok":
+                                last_status_ok = True # Отмечаем успешное завершение
+                            else:
+                                error_msg = status_data.get("message", "Unknown TTS server error")
+                                logger.error(f"Paroli Server TTS failed for {client_id}: {error_msg}")
+                                await self.send_error(client_id, f"Text-to-Speech failed: {error_msg}")
+                        except json.JSONDecodeError:
+                            logger.error(f"Could not decode final status JSON from Paroli for {client_id}: {message}")
+                            await self.send_error(client_id, "Received invalid final status from TTS server.")
+                        break # End receiving loop after final text message
+                    else:
+                        logger.warning(f"Received unexpected message type from Paroli Server for {client_id}: {type(message)}")
 
-                        await self.send_tts_chunk(client_id, chunk_b64, is_final) # Pass the flag
-                        # Add a small sleep ONLY if needed to prevent overwhelming network/client
-                        # await asyncio.sleep(0.005) # Very small delay if needed
+                # После выхода из цикла while
+                if last_status_ok: # Отправляем сигнал об окончании только если был статус "ok"
+                     if client_id in self.active_connections and self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
+                         await self.send_tts_finished(client_id)
+                     if chunks_sent_to_browser == 0:
+                          logger.warning(f"Paroli finished OK but sent no audio chunks for {client_id}.")
 
-                logger.info(f"Finished sending TTS audio ({chunks_sent}/{total_chunks} chunks) for {client_id}")
 
-        except FileNotFoundError:
-             logger.error(f"Piper executable not found at '{settings.piper.executable}'. Please ensure it's installed and in PATH.")
-             # Check connection before sending error
-             if client_id in self.active_connections and self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
-                 await self.send_error(client_id, "Text-to-Speech engine not found.")
+                logger.info(f"Finished streaming TTS audio ({chunks_sent_to_browser} chunks) from Paroli Server for {client_id}")
+
+            # Блок async with автоматически закроет соединение paroli_ws здесь,
+            # даже если внутри цикла произошел break или исключение (кроме ConnectionClosed...)
+
+        # Обработка ошибок подключения и других внешних ошибок
+        except websockets.exceptions.InvalidURI:
+            logger.error(f"Invalid Paroli Server WebSocket URL: {settings.paroli_server.ws_url}")
+            await self.send_error(client_id, "Invalid TTS server address configured.")
+        except ConnectionRefusedError:
+             logger.error(f"Connection refused by Paroli Server at {settings.paroli_server.ws_url}. Is it running?")
+             await self.send_error(client_id, "Could not connect to Text-to-Speech server.")
+        except asyncio.TimeoutError: # Таймаут при подключении
+             logger.error(f"Timeout connecting to Paroli Server at {settings.paroli_server.ws_url}.")
+             await self.send_error(client_id, "Timeout connecting to Text-to-Speech server.")
         except Exception as e:
-            logger.error(f"Piper TTS Error for {client_id}: {e}", exc_info=True)
-            # Check connection before sending error
+            logger.error(f"Paroli Server TTS Error for {client_id}: {e}", exc_info=True)
             if client_id in self.active_connections and self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
                 await self.send_error(client_id, f"Text-to-Speech error: {e}")
         finally:
-            # Clean up temporary file (same as before)
-            if output_path and os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError as e:
-                    logger.warning(f"Could not remove temporary TTS file {output_path}: {e}")
-
-            # Transition back to wake word listening (same as before)
+            # Блок finally нужен только для перехода в состояние wakeword,
+            # закрытие соединения обрабатывается через async with.
             if client_id in self.states and client_id in self.active_connections:
                  logger.info(f"TTS process finished for {client_id}, returning to wakeword state.")
                  self.states[client_id] = "wakeword"
-                 # Check connection before sending status
-                 if self.active_connections[client_id].client_state == WebSocketState.CONNECTED:
+                 browser_websocket = self.active_connections.get(client_id)
+                 if browser_websocket and browser_websocket.client_state == WebSocketState.CONNECTED:
                      await self.send_status(client_id, "wakeword_listening", "Waiting for wake word...")
             else:
-                 logger.info(f"Client {client_id} disconnected during or after TTS cleanup.")
+                 logger.info(f"Client {client_id} disconnected during or after Paroli TTS cleanup.")
 
 
 manager = ConnectionManager()
@@ -505,8 +657,5 @@ if __name__ == "__main__":
     if not os.path.isabs(settings.vosk.model_path) and not os.path.exists("models"):
          os.makedirs("models/vosk", exist_ok=True)
          print("Created models/vosk directory. Please place Vosk model files there.")
-    if not os.path.isabs(settings.piper.model_path) and not os.path.exists("models"):
-         os.makedirs("models/piper", exist_ok=True)
-         print("Created models/piper directory. Please place Piper model files there.")
 
     uvicorn.run(app, host=settings.webapp.host, port=settings.webapp.port)

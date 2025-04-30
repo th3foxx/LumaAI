@@ -1,5 +1,3 @@
-// --- START OF FILE audio-processor.js ---
-
 const AUDIO_FRAME_LENGTH = 512; // Must match the main script's setting
 const TARGET_SAMPLE_RATE = 16000; // Must match the main script's setting
 
@@ -108,5 +106,3 @@ class AudioRecorderProcessor extends AudioWorkletProcessor {
 
 // Register the processor with a unique name.
 registerProcessor('audio-recorder-processor', AudioRecorderProcessor);
-
-// --- END OF FILE audio-processor.js ---

@@ -5,20 +5,17 @@ const pageProtocol = window.location.protocol; // Check if page is https: or htt
 const wsProtocol = pageProtocol === 'https:' ? 'wss:' : 'ws:'; // Use wss: if page is https:, otherwise ws:
 const WEBSOCKET_URL = `${wsProtocol}//${window.location.host}/ws/user-${Date.now()}`; // Construct URL dynamically
 const TARGET_SAMPLE_RATE = 16000; // Rate expected by backend (Vosk, Porcupine, Cobra)
+const TTS_EXPECTED_SAMPLE_RATE = 22050;
 const AUDIO_FRAME_LENGTH = 512; // Samples per chunk sent to backend (matches Porcupine/Cobra)
-// BUFFER_SIZE is no longer directly used for ScriptProcessorNode, but keep concept if needed elsewhere
-// const BUFFER_SIZE = 4096;
 const AUDIO_PROCESSOR_URL = '/static/audio-processor.js';
 
 // --- State ---
 let websocket = null;
 let audioContext = null;
-// let audioProcessor = null; // Replaced by audioWorkletNode
 let audioWorkletNode = null;
 let microphoneStream = null;
 let isRecording = false;
 let currentTTSChunks = []; // Buffer for incoming TTS chunks
-let isBufferingTTS = false; // Flag to indicate if we are collecting TTS chunks
 let isAudioWorkletReady = false; // Flag to track worklet loading
 
 // --- DOM Elements ---
@@ -272,40 +269,33 @@ function connectWebSocket() {
     websocket.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
-            // console.log("WebSocket message received:", message.type); // Less verbose
+            // console.log("WebSocket message received:", message.type);
 
             switch (message.type) {
                 case "status":
-                    updateStatus(message.message, `status-${message.code.split('_')[0]}`); // e.g., status-wakeword, status-listening
-                    // Ensure recording is active when expected
+                    updateStatus(message.message, `status-${message.code.split('_')[0]}`);
                     if ((message.code === "wakeword_listening" || message.code === "listening_started") && !isRecording) {
                        console.log("Server expects listening, ensuring audio processing is active.");
-                       // Re-check context/worklet readiness before starting
                        createAudioContextAndWorklet().then(ready => {
-                           if (ready) {
-                               startAudioProcessing();
-                           } else {
-                               showError("Failed to initialize audio system when server requested listening.");
-                           }
+                           if (ready) { startAudioProcessing(); }
+                           else { showError("Failed to initialize audio system when server requested listening."); }
                        });
-                    } else if (message.code === "processing_finished" && isRecording) {
-                        // Optional: Stop recording explicitly if server indicates it's done processing
-                        // console.log("Server finished processing, stopping local recording.");
-                        // stopAudioProcessing();
                     }
                     break;
                 case "transcript":
                     updateTranscript(message.text, message.is_final);
                     break;
                 case "tts_chunk":
-                    // Start buffering if this is the first chunk (implicitly)
-                    isBufferingTTS = true;
-                    handleTTSChunk(message.data, message.is_final); // Pass the flag
+                    // Просто добавляем чанк в буфер. Флаг is_final больше не используется здесь.
+                    handleTTSChunk(message.data);
+                    break;
+                case "tts_finished":
+                    console.log("Received TTS finished signal.");
+                    // Обрабатываем накопленные чанки
+                    processBufferedTTS();
                     break;
                 case "error":
                     showError(`Server error: ${message.message}`);
-                    // Optionally stop recording on critical errors
-                    // stopAudioProcessing();
                     break;
                 default:
                     console.warn("Unknown message type:", message.type);
@@ -319,32 +309,20 @@ function connectWebSocket() {
     websocket.onerror = (event) => {
         console.error("WebSocket error:", event);
         showError("WebSocket connection error. Check console. Trying to reconnect...");
-        // Clean up before attempting reconnect
         stopAudioProcessing();
-        if (websocket) {
-            // Don't set websocket to null here, onclose will handle it
-            websocket.close(); // Ensure it's closed if onerror doesn't trigger onclose
-        }
-        // Reconnection logic moved to onclose for consistency
+        if (websocket) { websocket.close(); }
     };
 
     websocket.onclose = (event) => {
         console.log(`WebSocket closed: Code=${event.code}, Reason='${event.reason}', WasClean=${event.wasClean}`);
-        stopAudioProcessing(); // Stop mic when disconnected
-
-        // Clear WebSocket reference *after* checking state
-        websocket = null;
-
+        stopAudioProcessing();
+        websocket = null; // Clear reference *after* checking state
         if (!event.wasClean) {
             showError(`WebSocket closed unexpectedly (Code: ${event.code}). Trying to reconnect...`);
-            // Schedule reconnection only if not closed cleanly or intentionally
-             setTimeout(connectWebSocket, 5000); // Simple reconnect after 5 seconds
+             setTimeout(connectWebSocket, 5000);
         } else {
-            if (event.code === 1000 && event.reason === "Client initiated reconnect") {
-                 updateStatus("Reconnecting...", "status-connecting"); // Specific status for manual reconnect
-            } else {
-                 updateStatus("Disconnected", "status-error");
-            }
+            if (event.code === 1000 && event.reason === "Client initiated reconnect") { updateStatus("Reconnecting...", "status-connecting"); }
+            else { updateStatus("Disconnected", "status-error"); }
         }
     };
 }
@@ -398,78 +376,103 @@ function base64ToArrayBuffer(base64) {
 }
 
 
-function handleTTSChunk(base64Data, isFinal) {
-    if (!isBufferingTTS) {
-        console.warn("Received TTS chunk but not in buffering state. Ignoring.");
-        return;
-    }
-
+function handleTTSChunk(base64Data) {
     const arrayBuffer = base64ToArrayBuffer(base64Data);
     if (arrayBuffer && arrayBuffer.byteLength > 0) {
-        currentTTSChunks.push(arrayBuffer); // Add chunk to buffer
+        currentTTSChunks.push(arrayBuffer); // Просто добавляем в буфер
     } else if (arrayBuffer && arrayBuffer.byteLength === 0) {
          console.log("Received empty TTS chunk, ignoring.");
-         // Don't treat an empty chunk as final unless the flag says so
     } else {
          console.error("Failed to decode TTS chunk, skipping.");
-         // Decide if this error should stop buffering? Maybe not.
-    }
-
-    // If this is the final chunk, process the complete audio
-    if (isFinal) {
-        console.log(`Received final TTS chunk. Total chunks: ${currentTTSChunks.length}`);
-        isBufferingTTS = false; // Stop buffering state
-
-        if (currentTTSChunks.length > 0) {
-            const completeAudioData = concatenateArrayBuffers(currentTTSChunks);
-            console.log(`Reassembled TTS audio data: ${completeAudioData.byteLength} bytes`);
-            const chunksToPlay = [...currentTTSChunks]; // Copy buffer before clearing
-            currentTTSChunks = []; // Clear the buffer
-            playCompleteTTSAudio(completeAudioData); // Play the full audio
-        } else {
-            console.warn("Final TTS chunk indicated, but no valid chunks were buffered.");
-            currentTTSChunks = []; // Ensure buffer is clear
-        }
     }
 }
 
 
+function processBufferedTTS() {
+    if (currentTTSChunks.length > 0) {
+        const completeAudioData = concatenateArrayBuffers(currentTTSChunks);
+        console.log(`Reassembled TTS audio data: ${completeAudioData.byteLength} bytes`);
+        // Воспроизводим собранные данные
+        playCompleteTTSAudio(completeAudioData);
+    } else {
+        console.warn("TTS finished signal received, but no valid chunks were buffered.");
+    }
+    // Очищаем буфер в любом случае
+    currentTTSChunks = [];
+}
+
+
 async function playCompleteTTSAudio(completeAudioData) {
-    // Use createAudioContextAndWorklet to ensure context exists, but don't need worklet part here
+    // Use createAudioContextAndWorklet to ensure context exists
     if (!await createAudioContextAndWorklet()) {
         console.error("Cannot play TTS, AudioContext not available.");
         showError("Audio playback failed.");
         return;
     }
-     if (!completeAudioData || completeAudioData.byteLength === 0) {
+    if (!completeAudioData || completeAudioData.byteLength === 0) {
         console.warn("Attempted to play empty or invalid audio data.");
         return;
     }
 
     try {
-        console.log("Decoding complete TTS audio data...");
-        // Resume context just before decoding/playing, in case it suspended
+        console.log(`Processing complete raw TTS audio data (${completeAudioData.byteLength} bytes) expected at ${TTS_EXPECTED_SAMPLE_RATE} Hz...`);
+        // Resume context just before playing, in case it suspended
         if (audioContext.state === 'suspended') {
             await audioContext.resume();
         }
-        // Decode the *entire* WAV data (assuming it's WAV or compatible format)
-        const audioBuffer = await audioContext.decodeAudioData(completeAudioData);
-        console.log(`Successfully decoded audio: Duration ${audioBuffer.duration.toFixed(2)}s`);
 
+        // --- Manual AudioBuffer Creation from Raw PCM ---
+        // Assumptions: TTS_EXPECTED_SAMPLE_RATE (e.g., 22050 Hz), 16-bit Signed PCM, Mono
+
+        // Use the DEFINED TTS rate here, NOT audioContext.sampleRate
+        const sourceSampleRate = TTS_EXPECTED_SAMPLE_RATE;
+        const numberOfChannels = 1; // Assuming mono output from Paroli
+
+        // Calculate number of samples: byteLength / (bytes per sample)
+        const numberOfSamples = completeAudioData.byteLength / 2; // 16-bit = 2 bytes/sample
+
+        if (completeAudioData.byteLength % 2 !== 0) {
+            console.warn("Raw audio data has odd byte length, potential data corruption or incorrect assumption.");
+            // You might need to decide how to handle this - e.g., truncate
+        }
+
+        console.log(`Creating AudioBuffer: ${numberOfChannels}ch, ${numberOfSamples} samples, ${sourceSampleRate}Hz`);
+
+        // Create an empty AudioBuffer specifying the *source* sample rate
+        // The browser will resample this buffer to the audioContext's output rate during playback.
+        const audioBuffer = audioContext.createBuffer(numberOfChannels, numberOfSamples, sourceSampleRate);
+
+        // Get the channel data buffer (Float32Array) to fill
+        const channelData = audioBuffer.getChannelData(0); // Channel 0 for mono
+
+        // Create an Int16Array view onto the raw ArrayBuffer data
+        const pcmData = new Int16Array(completeAudioData);
+
+        // Convert Int16 PCM to Float32 (-1.0 to 1.0) and fill the AudioBuffer
+        for (let i = 0; i < numberOfSamples; i++) {
+            // Ensure index is within bounds if byte length was odd and not handled above
+            if (i < pcmData.length) {
+                 channelData[i] = pcmData[i] / 32768.0; // Normalize Int16 to Float32 range
+            }
+        }
+        console.log(`Successfully created AudioBuffer from raw PCM. Duration: ${audioBuffer.duration.toFixed(2)}s`);
+        // --- End Manual AudioBuffer Creation ---
+
+
+        // Play the created AudioBuffer
         const source = audioContext.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioContext.destination);
         source.onended = () => {
             console.log("TTS playback finished.");
-            // No need to trigger next chunk, playback is complete
+            // Any cleanup or state change needed after playback finishes
         };
         source.start();
         console.log("Starting TTS playback...");
 
     } catch (e) {
-        console.error("Error decoding or playing complete TTS audio:", e);
+        console.error("Error processing or playing raw TTS audio:", e);
         showError(`Error playing assistant response: ${e.message}`);
-        // Log the first few bytes if decoding fails, might hint at format issues
         const firstBytes = new Uint8Array(completeAudioData.slice(0, 12));
         console.error("First 12 bytes of failed audio data:", firstBytes);
     }
@@ -509,14 +512,3 @@ document.addEventListener('DOMContentLoaded', () => {
     // Start connection on load if supported
     connectWebSocket();
 });
-
-// Optional: Add a button or interaction to resume AudioContext if needed
-// document.body.addEventListener('click', async () => {
-//     if (audioContext && audioContext.state === 'suspended') {
-//         console.log("Attempting to resume AudioContext on user interaction...");
-//         await audioContext.resume();
-//         console.log("AudioContext state after resume attempt:", audioContext.state);
-//     }
-// }, { once: true }); // Only need one interaction usually
-
-// --- END OF FILE script.js ---
