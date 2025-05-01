@@ -19,6 +19,7 @@ from vosk import Model as VoskModel, KaldiRecognizer
 # Project specific imports
 from settings import settings
 from llm.llm import ask_lumi 
+from mqtt_client import startup_mqtt_client, shutdown_mqtt_client, mqtt_client
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -198,8 +199,15 @@ def initialize_resources():
 # --- FastAPI App ---
 app = FastAPI(
     title="Lumi Voice Assistant",
-    on_startup=[initialize_resources, start_paroli_server],
-    on_shutdown=[stop_paroli_server],                     
+    on_startup=[
+        initialize_resources,
+        start_paroli_server,
+        startup_mqtt_client # Add MQTT startup
+    ],
+    on_shutdown=[
+        stop_paroli_server,
+        shutdown_mqtt_client # Add MQTT shutdown
+    ],
 )
 
 # Mount static files (HTML, JS)

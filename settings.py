@@ -105,6 +105,17 @@ class AISettings:
 
 
 @dataclass(frozen=True)
+class MqttBrokerSettings:
+    """Настройки подключения к MQTT брокеру (Mosquitto)."""
+    host: str = os.getenv("MQTT_HOST", "localhost")
+    port: int = int(os.getenv("MQTT_PORT", 1883))
+    username: Optional[str] = os.getenv("MQTT_USER") # None если переменная не установлена
+    password: Optional[str] = os.getenv("MQTT_PASSWORD") # None если переменная не установлена
+    client_id_prefix: str = os.getenv("MQTT_CLIENT_ID_PREFIX", "lumi_voice_assistant_")
+    default_topic_base: str = os.getenv("MQTT_Z2M_TOPIC_BASE", "zigbee2mqtt") # Базовый топик Zigbee2MQTT
+
+
+@dataclass(frozen=True)
 class Settings:
     """Главный объект конфигурации приложения."""
     picovoice: PicovoiceSettings = field(default_factory=PicovoiceSettings)
@@ -116,6 +127,7 @@ class Settings:
     webapp: WebAppSettings = field(default_factory=WebAppSettings)
     postgres: PostgresSettings = field(default_factory=PostgresSettings)
     ai: AISettings = field(default_factory=AISettings)
+    mqtt_broker: MqttBrokerSettings = field(default_factory=MqttBrokerSettings)
 
 
 # Единая точка доступа к настройкам
