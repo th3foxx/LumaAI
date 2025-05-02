@@ -3,7 +3,7 @@
 // --- Configuration ---
 const pageProtocol = window.location.protocol; // Check if page is https: or http:
 const wsProtocol = pageProtocol === 'https:' ? 'wss:' : 'ws:'; // Use wss: if page is https:, otherwise ws:
-const WEBSOCKET_URL = `${wsProtocol}//${window.location.host}/ws/user-${Date.now()}`; // Construct URL dynamically
+const WEBSOCKET_URL = `${wsProtocol}//${window.location.host}/ws`; // Fixed WebSocket endpoint URL
 const TARGET_SAMPLE_RATE = 16000; // Rate expected by backend (Vosk, Porcupine, Cobra)
 const TTS_EXPECTED_SAMPLE_RATE = 22050;
 const AUDIO_FRAME_LENGTH = 512; // Samples per chunk sent to backend (matches Porcupine/Cobra)

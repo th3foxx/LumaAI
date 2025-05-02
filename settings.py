@@ -19,6 +19,7 @@ class VADSettings:
     probability_threshold: float = float(os.getenv("VAD_PROBABILITY_THRESHOLD", 0.6))
     silence_frames: int = int(os.getenv("VAD_SILENCE_FRAMES", 60))
     min_listening_frames: int = int(os.getenv("VAD_MIN_LISTENING_FRAMES", 30))
+    max_listening_frames: int = int(os.getenv("VAD_MAX_LISTENING_FRAMES", 300))
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class ParoliServerSettings:
     decoder_path: Optional[str] = os.getenv("PAROLI_DECODER_PATH", "./models/paroli/models/decoder.rknn")
     config_path: Optional[str] = os.getenv("PAROLI_CONFIG_PATH", "./models/paroli/models/model.json")
     executable: str = os.getenv("PAROLI_EXECUTABLE", "./models/paroli/paroli-server")
+    receive_timeout: float = 20.0 # Таймаут ожидания сообщения от Paroli (в секундах)
 
     ip: str = os.getenv("PAROLI_IP", "127.0.0.1")
     port: int = int(os.getenv("PAROLI_PORT", 8848))
@@ -102,6 +104,7 @@ class AISettings:
     temperature: float = float(os.getenv("TEMPERATURE", 0.0))
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    history_length: int = 10
 
 
 @dataclass(frozen=True)
