@@ -7,7 +7,6 @@ import logging
 import os
 import struct
 import websockets
-import atexit # Для корректного закрытия ресурсов LLM
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +22,10 @@ from vosk import Model as VoskModel, KaldiRecognizer
 # Project specific imports
 from settings import settings
 from llm.llm import ask_lumi, close_llm_resources
-from mqtt_client import startup_mqtt_client, shutdown_mqtt_client, mqtt_client
+from mqtt_client import startup_mqtt_client, shutdown_mqtt_client
+
+from connectivity import is_internet_available
+from offline_controller import parse_offline_command, execute_offline_command
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -272,7 +274,7 @@ class ConnectionManager:
              return False
         if not self.recognizer: # Create if it doesn't exist
             self.recognizer = KaldiRecognizer(vosk_model, settings.vosk.sample_rate)
-            self.recognizer.SetWords(True) # Get word timings if needed
+            self.recognizer.SetWords(False) # Get word timings if needed
             logger.info("Vosk recognizer created.")
         else: # Reset if it exists from a previous connection
             self.recognizer.Reset()
@@ -353,45 +355,72 @@ class ConnectionManager:
         logger.error(f"Sending error to client: {error_message}")
         await self._send_json({"type": "error", "message": error_message})
 
-    async def _run_llm_and_tts(self, text: str, thread_id: str):
-        """Runs LLM and TTS in the background."""
-        logger.info(f"Starting background task: LLM query for '{text[:50]}...'")
+    async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
+        """
+        Runs LLM+TTS if online, otherwise attempts offline command parsing and execution.
+        """
+        logger.info(f"Starting background task for text: '{text[:50]}...'")
+        response_text = "" # Text to be spoken back to the user
+
         try:
-            # 1. Send processing status
+            # 1. Send initial processing status
             await self.send_status("processing_started", "Thinking...")
             self.state = "processing" # Update state
 
-            # 2. Call LLM (uses run_in_executor internally via LangGraph)
-            # lumi_response = await asyncio.to_thread(ask_lumi, text, thread_id=thread_id) # Alternative if ask_lumi wasn't async friendly
-            lumi_response = await ask_lumi(text, thread_id=thread_id)
-            logger.info(f"LLM response received: '{lumi_response[:50]}...'")
+            # 2. Check Internet Connectivity
+            online = await is_internet_available()
 
-            if not lumi_response:
-                 logger.warning("LLM returned an empty response.")
-                 await self.send_error("Assistant did not provide a response.")
+            if online and settings.ai.online_mode:
+                # --- ONLINE: Use LLM ---
+                logger.info("Internet available. Using LLM.")
+                # Call LLM (uses run_in_executor internally via LangGraph)
+                lumi_response = await ask_lumi(text, thread_id=thread_id)
+                logger.info(f"LLM response received: '{lumi_response[:50]}...'")
+
+                if not lumi_response:
+                     logger.warning("LLM returned an empty response.")
+                     response_text = "Sorry, I didn't get a response from the assistant."
+                else:
+                     response_text = lumi_response
+
+            else:
+                # --- OFFLINE: Use Rasa NLU API ---
+                logger.info("Internet unavailable. Attempting offline command processing via Rasa NLU API.")
+                # --- ИЗМЕНЕНИЕ ЗДЕСЬ: ДОБАВИТЬ await ---
+                parsed_command = await parse_offline_command(text)
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+                if parsed_command: # Теперь parsed_command будет словарем или None
+                    logger.info(f"Offline command parsed via API: {parsed_command}")
+                    # Execute the command via MQTT
+                    execution_result = await execute_offline_command(parsed_command)
+                    logger.info(f"Offline command execution result: {execution_result}")
+                    response_text = execution_result
+                else:
+                    logger.warning(f"Offline command parsing via API failed for text: '{text}'")
+                    response_text = "Sorry, I couldn't understand that command while offline."
+
+            # 3. Synthesize and Send Response (if any)
+            if response_text:
+                await self.send_status("speaking_started", "Speaking...")
+                self.state = "speaking" # Update state
+                await self.synthesize_and_send_tts(response_text) # Handles streaming TTS chunks
+            else:
+                 # No response text generated (e.g., empty LLM response and no error message)
+                 logger.warning("No response text generated to speak.")
                  # Go back to listening state directly
                  self.state = "wakeword"
                  await self.send_status("wakeword_listening", "Waiting for wake word...")
-                 return # Exit background task
 
-            # 3. Send speaking status and start TTS
-            await self.send_status("speaking_started", "Speaking...")
-            self.state = "speaking" # Update state
-            await self.synthesize_and_send_tts(lumi_response) # This handles streaming TTS chunks
-
-            # 4. TTS finished (or failed), transition back to wakeword
-            # synthesize_and_send_tts now handles sending tts_finished
-            # The 'finally' block in synthesize_and_send_tts is removed
-            # We transition state *after* TTS completes or fails here.
 
         except asyncio.CancelledError:
-             logger.info("LLM/TTS background task was cancelled.")
+             logger.info("LLM/TTS/Offline background task was cancelled.")
              # State might be processing or speaking, force back to wakeword if client still connected
              if self.state != "disconnected":
                 self.state = "wakeword"
                 await self.send_status("wakeword_listening", "Processing cancelled. Waiting for wake word...")
         except Exception as e:
-            logger.error(f"Error during LLM call or TTS in background task: {e}", exc_info=True)
+            logger.error(f"Error during LLM/TTS/Offline processing in background task: {e}", exc_info=True)
             await self.send_error(f"Error processing request: {str(e)}")
             # Go back to listening state after error
             if self.state != "disconnected":
@@ -400,7 +429,7 @@ class ConnectionManager:
         finally:
             # Ensure state is reset correctly if the task finishes normally or with non-critical errors handled within synthesize_and_send_tts
             if self.state not in ["disconnected", "wakeword"]: # If not already reset by error or cancellation
-                 logger.info("LLM/TTS background task finished. Returning to wakeword state.")
+                 logger.info("LLM/TTS/Offline background task finished. Returning to wakeword state.")
                  self.state = "wakeword"
                  await self.send_status("wakeword_listening", "Waiting for wake word...")
             self.llm_tts_task = None # Clear the task reference
@@ -525,7 +554,7 @@ class ConnectionManager:
                             # Start LLM & TTS in background
                             self.state = "wakeword" # Set state immediately back to allow potential wake word detection later
                             self.llm_tts_task = asyncio.create_task(
-                                self._run_llm_and_tts(final_transcript, thread_id)
+                                self._run_llm_tts_or_offline(final_transcript, thread_id)
                             )
                             # *DO NOT* await the task here. Let it run in the background.
                             # Status updates ("processing", "speaking") are handled within the task.

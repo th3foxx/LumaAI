@@ -38,20 +38,17 @@ COLOR_NAME_TO_XY: Dict[str, List[float]] = {
 # Standard range often ~153 (6500K) to ~500 (2000K)
 COLOR_TEMP_PRESETS: Dict[str, int] = {
     # English
-    "coolest": 153,   # Approx 6500K
+    "coolest": 167,   # Approx 6500K
     "cool": 250,      # Approx 4000K
-    "neutral": 333,   # Approx 3000K
-    "warm": 400,      # Approx 2500K
-    "warmest": 500,   # Approx 2000K
+    "warm": 280,      # Approx 2500K
+    "warmest": 333,   # Approx 2000K
     # Russian
-    "самый холодный": 153,
+    "самый холодный": 167,
     "холодный": 250,
-    "нейтральный": 333,
     "белый дневной": 250, # Alias for cool
-    "белый": 333, # Alias for neutral
-    "теплый": 400,
-    "самый теплый": 500,
-    "желтый свет": 454, # Common warm value on some bulbs
+    "белый": 167,
+    "теплый": 280,
+    "самый теплый": 333,
 }
 
 def normalize_text_key(name: str) -> str:

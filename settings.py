@@ -105,6 +105,7 @@ class AISettings:
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
+    online_mode: bool = bool(os.getenv("AI_ONLINE_MODE", True))
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,17 @@ class MqttBrokerSettings:
     password: Optional[str] = os.getenv("MQTT_PASSWORD") # None если переменная не установлена
     client_id_prefix: str = os.getenv("MQTT_CLIENT_ID_PREFIX", "lumi_voice_assistant_")
     default_topic_base: str = os.getenv("MQTT_Z2M_TOPIC_BASE", "zigbee2mqtt") # Базовый топик Zigbee2MQTT
+
+
+@dataclass(frozen=True)
+class RasaNLUSettings:
+    """Настройки подключения к Rasa NLU серверу."""
+    # Полный URL к эндпоинту /model/parse
+    url: Optional[str] = os.getenv("RASA_NLU_URL", "http://localhost:5005/model/parse")
+    # Таймаут ожидания ответа от Rasa в секундах
+    timeout: float = float(os.getenv("RASA_NLU_TIMEOUT", 5.0))
+    # Минимальный порог уверенности для принятия интента
+    intent_confidence_threshold: float = float(os.getenv("RASA_INTENT_CONFIDENCE_THRESHOLD", 0.75))
 
 
 @dataclass(frozen=True)
@@ -131,6 +143,7 @@ class Settings:
     postgres: PostgresSettings = field(default_factory=PostgresSettings)
     ai: AISettings = field(default_factory=AISettings)
     mqtt_broker: MqttBrokerSettings = field(default_factory=MqttBrokerSettings)
+    rasa_nlu: RasaNLUSettings = field(default_factory=RasaNLUSettings)
 
 
 # Единая точка доступа к настройкам
