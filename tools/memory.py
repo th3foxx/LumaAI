@@ -1,8 +1,5 @@
-from langgraph.checkpoint.memory import MemorySaver
 from langmem import create_manage_memory_tool, create_search_memory_tool
 
-
-memory_checkpointer = MemorySaver()
 
 manage_mem = create_manage_memory_tool(namespace=("memories",), instructions="""
 Proactively call this tool when you:

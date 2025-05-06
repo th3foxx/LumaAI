@@ -10,9 +10,9 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore # Use BaseStore for type hint
 from langgraph.store.postgres import PostgresStore # Keep specific import for instantiation
 from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 
-from tools.tools import TOOLS
-from tools.memory import memory_checkpointer # Assuming this is correct
+from tools import TOOLS
 from settings import settings
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # Global store variable to manage its lifecycle
 _store_cm = None
 _store: Optional[BaseStore] = None
+memory_checkpointer = MemorySaver()
 
 def get_store() -> BaseStore:
     """Gets the initialized PostgresStore instance."""
@@ -185,7 +186,6 @@ def _get_app_and_prompt() -> tuple[any, SystemMessage]:
             "If YES, provide a concise answer immediately without using tools. "
             "If NO, and the request requires external action (like controlling a device, searching memory, etc.) or information you don't have, IDENTIFY the necessary tool and its arguments. "
 
-            "When using a tool: Briefly state *what* you need the tool for (e.g., 'Checking device status...', 'Looking up notes...'), then call the tool immediately. "
             "After the tool runs, use its output to formulate your final, concise response to the user."
 
             "Keep your spoken responses natural and brief."

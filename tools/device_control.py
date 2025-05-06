@@ -1,28 +1,24 @@
+# tools/device_control.py
 from typing import List, Dict, Optional, Any
 import json
 import logging
 from thefuzz import process as fuzz_process, fuzz
 
 from langchain_core.tools import tool
-from mqtt_client import mqtt_client
-from settings import settings
-from .memory import manage_mem, search_mem
+# Adjust relative paths based on your project structure
+# If tools/, mqtt_client.py, settings.py are siblings:
+from mqtt_client import mqtt_client # Абсолютный импорт от корня проекта
+from settings import settings       # Абсолютный импорт от корня проекта
+# If tools/ is inside a src/ dir and mqtt_client/settings are too:
+# from src.mqtt_client import mqtt_client
+# from src.settings import settings
+from .helpers import normalize_text_key, normalize_attribute_name, parse_value
 
 logger = logging.getLogger(__name__)
 
-# --- Color Handling ---
+# --- Constants specific to device control ---
 # Approximate CIE XY coordinates for common color names.
 COLOR_NAME_TO_XY: Dict[str, List[float]] = {
-    # English
-    "red": [0.701, 0.299], "strong red": [0.701, 0.299],
-    "green": [0.172, 0.747], "lime": [0.215, 0.711],
-    "blue": [0.136, 0.040], "strong blue": [0.136, 0.040],
-    "yellow": [0.527, 0.413], "gold": [0.527, 0.413],
-    "orange": [0.611, 0.375],
-    "purple": [0.250, 0.100], "magenta": [0.409, 0.188], "pink": [0.415, 0.177],
-    "cyan": [0.170, 0.361], "turquoise": [0.170, 0.361],
-    "white": [0.313, 0.329], # Neutral white - Use color_temp for better control
-    # Russian
     "красный": [0.701, 0.299], "алый": [0.701, 0.299],
     "зеленый": [0.172, 0.747], "салатовый": [0.215, 0.711],
     "синий": [0.136, 0.040], "голубой": [0.170, 0.361],
@@ -33,64 +29,16 @@ COLOR_NAME_TO_XY: Dict[str, List[float]] = {
     "белый": [0.313, 0.329],
 }
 
-# --- Color Temperature Preset Handling ---
-# Mapping descriptive terms to Mired values (lower Mired = cooler Kelvin)
-# Standard range often ~153 (6500K) to ~500 (2000K)
+# Mapping descriptive terms to Mired values
 COLOR_TEMP_PRESETS: Dict[str, int] = {
-    # English
-    "coolest": 167,   # Approx 6500K
-    "cool": 250,      # Approx 4000K
-    "warm": 280,      # Approx 2500K
-    "warmest": 333,   # Approx 2000K
-    # Russian
     "самый холодный": 167,
     "холодный": 250,
-    "белый дневной": 250, # Alias for cool
+    "белый дневной": 250,
     "белый": 167,
     "теплый": 280,
     "самый теплый": 333,
 }
-
-def normalize_text_key(name: str) -> str:
-    """Normalizes text key to lowercase and strips whitespace."""
-    return name.lower().strip()
-
-# --- End Preset Handling ---
-
-
-@tool
-def say_to_console(text: str) -> str:
-    """Outputs a text to the console"""
-    logger.info(f"[Tool Output] Console: {text}")
-    return f"Okay, printed '{text}' to console."
-
-def normalize_attribute_name(attr_name: str) -> str:
-    """Приводит имя атрибута к нижнему регистру и заменяет пробелы на подчеркивания."""
-    return attr_name.lower().replace(" ", "_")
-
-
-def parse_value(value_str: str, target_type: str) -> Optional[Any]:
-    """Пытается преобразовать строку значения в нужный тип (int, float, bool, str). Excludes preset logic."""
-    try:
-        if target_type == "numeric":
-             # Пытаемся сначала в int, потом в float
-             try: return int(value_str)
-             except ValueError: return float(value_str)
-        elif target_type == "binary":
-            # Приводим к стандартным ON/OFF для простоты
-            val_lower = value_str.strip().lower()
-            # Расширяем синонимы
-            if val_lower in ["on", "вкл", "включить", "включи", "1", "true", "да"]: return "ON"
-            if val_lower in ["off", "выкл", "выключить", "выключи", "0", "false", "нет"]: return "OFF"
-            if val_lower in ["toggle", "переключить", "переключи"]: return "TOGGLE"
-            return None # Не распознано
-        elif target_type == "enum":
-            return value_str # Возвращаем как есть, проверка будет по списку
-        else: # По умолчанию считаем строкой
-            return value_str
-    except (ValueError, TypeError):
-        logger.warning(f"Could not parse value '{value_str}' as {target_type}")
-        return None
+# --- End Constants ---
 
 
 def find_capability(capabilities: Dict[str, Dict[str, Any]], requested_attr: str) -> Optional[Dict[str, Any]]:
@@ -150,11 +98,12 @@ def set_device_attribute(
     match_method = "None"
     best_score = 0
 
-    # 1. Найти целевое устройство (Logic remains the same)
+    # 1. Найти целевое устройство
     if guessed_friendly_name:
         guess_validation_threshold = 80
         exactish_match = None; highest_score = 0
         for device in available_devices:
+            # Use helper for normalization
             if normalize_attribute_name(guessed_friendly_name) == normalize_attribute_name(device):
                 exactish_match = device
                 highest_score = 100
@@ -205,6 +154,7 @@ def set_device_attribute(
         return f"Sorry, could not retrieve capabilities for device '{target_device_name}'. It might be offline or recently removed."
 
     # 3. Найти запрошенную возможность (capability/attribute)
+    # Use local helper function
     capability_details = find_capability(capabilities, attribute)
     if not capability_details:
         available_attrs = list(capabilities.keys())
@@ -240,6 +190,7 @@ def set_device_attribute(
         if not (supports_xy or is_composite):
              return f"Sorry, the device '{target_device_name}' does not seem to support setting color via XY coordinates (required for color names)."
 
+        # Use helper for normalization
         normalized_color = normalize_text_key(value)
         if normalized_color in COLOR_NAME_TO_XY:
             xy_coords = COLOR_NAME_TO_XY[normalized_color]
@@ -259,30 +210,26 @@ def set_device_attribute(
 
     # --- Handle 'color_temp' (with presets) ---
     elif cap_name_from_expose == 'color_temp':
+        # Use helper for normalization
         normalized_value_key = normalize_text_key(value)
         preset_mired_value = COLOR_TEMP_PRESETS.get(normalized_value_key)
         final_mired_value = None # Store the final numeric Mired value
 
         if preset_mired_value is not None:
-            # Found a matching preset
             logger.info(f"Mapped color temp preset '{normalized_value_key}' to Mired value {preset_mired_value}")
             final_mired_value = preset_mired_value
-            # Use the original user value (or normalized key) in the response for clarity
             final_value_repr = f"{normalized_value_key} ({preset_mired_value} Mired)"
         else:
-            # Not a preset, try parsing as a numeric Mired value
-            # TODO: Add Kelvin support? Requires 1,000,000 / K conversion. Check if 'K' is in value.
             if 'k' in value.lower():
                  return f"Sorry, setting color temperature by Kelvin (e.g., '4000K') is not yet supported. Please use Mired values (e.g., 153-500) or presets like 'cool', 'warm'."
 
+            # Use helper for parsing
             parsed_as_numeric = parse_value(value, "numeric")
             if isinstance(parsed_as_numeric, (int, float)):
                 final_mired_value = parsed_as_numeric
-                final_value_repr = str(final_mired_value) # Use the number itself
+                final_value_repr = str(final_mired_value)
             else:
-                # Failed both preset lookup and numeric parsing
                 known_presets_list = list(COLOR_TEMP_PRESETS.keys())
-                # Try fuzzy match on presets?
                 preset_match = fuzz_process.extractOne(normalized_value_key, known_presets_list, scorer=fuzz.token_sort_ratio, score_cutoff=75)
                 if preset_match:
                     suggestion = preset_match[0]
@@ -293,46 +240,39 @@ def set_device_attribute(
                             f"(like {', '.join(known_presets_list[:4])}...) "
                             f"or a valid numeric Mired value (typically 153-500).")
 
-        # Proceed with range check using the determined final_mired_value
         if final_mired_value is not None:
             min_val = capability_details.get("value_min")
             max_val = capability_details.get("value_max")
             is_valid = True
             range_str = ""
-            # Build range string for error message
             if min_val is not None: range_str += f"min {min_val}"
             if max_val is not None: range_str += f"{' ' if range_str else ''}max {max_val}"
 
-            # Check validity
             if min_val is not None and final_mired_value < min_val: is_valid = False
             if max_val is not None and final_mired_value > max_val: is_valid = False
 
             if not is_valid:
-                # Use the original user input 'value' in the error message for context
                 return f"Sorry, the value {final_mired_value} (from '{value}') for 'color_temp' is outside the allowed range ({range_str}) for device '{target_device_name}'."
             else:
-                # Value is valid, create payload
                 payload_dict = {mqtt_attribute_name: final_mired_value}
-                # final_value_repr is already set correctly above
 
     # --- Handle other types (numeric, binary, enum) ---
     else:
-        # Use the generic parse_value based on capability type
+        # Use helper for parsing
         parsed_value = parse_value(value, cap_type)
-        final_value = parsed_value # Keep track of the potentially modified value
+        final_value = parsed_value
 
         if final_value is None and cap_type != "enum":
              return f"Sorry, I couldn't understand the value '{value}' for the '{cap_name_from_expose}' attribute (expected type: {cap_type})."
 
-        # Validation and potential modifications based on type
         if cap_type == "numeric":
+            # ... (rest of numeric logic including percentage handling) ...
             if not isinstance(final_value, (int, float)):
                  return f"Sorry, expected a numeric value for '{cap_name_from_expose}', but received '{value}'."
 
             min_val = capability_details.get("value_min")
             max_val = capability_details.get("value_max")
 
-            # Handle brightness percentages BEFORE range check
             if cap_name_from_expose == 'brightness' and isinstance(value, str) and '%' in value:
                  try:
                      percent = float(value.replace('%','').strip())
@@ -340,18 +280,18 @@ def set_device_attribute(
                      abs_max = float(max_val) if max_val is not None else 254.0
                      abs_min = float(min_val) if min_val is not None else 0.0
                      calc_value = abs_min + (abs_max - abs_min) * (percent / 100.0)
+                     # Use int only if unit is not specified (Zigbee standard behavior)
                      final_value = calc_value if capability_details.get("unit") else int(round(calc_value))
                      logger.info(f"Converted brightness {percent}% to absolute value {final_value} (range {abs_min}-{abs_max})")
-                     # Update final_value_repr as well
                      final_value_repr = f"{percent}% ({final_value})"
                  except (ValueError, TypeError):
                      return f"Sorry, couldn't parse percentage value '{value}' for brightness."
 
-            # Range check (using potentially updated final_value)
             is_valid = True
             range_str = ""
             if min_val is not None: range_str += f"min {min_val}"
             if max_val is not None: range_str += f"{' ' if range_str else ''}max {max_val}"
+            # Check range using the potentially updated final_value
             if min_val is not None and final_value < min_val: is_valid = False
             if max_val is not None and final_value > max_val: is_valid = False
 
@@ -359,11 +299,10 @@ def set_device_attribute(
                  return f"Sorry, the value {final_value} (from '{value}') for '{cap_name_from_expose}' is outside the allowed range ({range_str})."
 
             payload_dict = {mqtt_attribute_name: final_value}
-            # Update final_value_repr if not already set by percentage logic
-            if '%' not in value: final_value_repr = str(final_value)
-
+            if '%' not in value: final_value_repr = str(final_value) # Update repr if not percentage
 
         elif cap_type == "binary":
+            # ... (rest of binary logic) ...
             allowed_vals = []
             val_on = capability_details.get("value_on", "ON")
             val_off = capability_details.get("value_off", "OFF")
@@ -379,11 +318,13 @@ def set_device_attribute(
                 final_value_repr = str(final_value)
 
         elif cap_type == "enum":
+            # ... (rest of enum logic) ...
             allowed_enum = capability_details.get("values")
             if not allowed_enum:
                  logger.warning(f"Enum capability '{cap_name_from_expose}' for device '{target_device_name}' has no defined values!")
                  return f"Sorry, the allowed options for '{cap_name_from_expose}' are not defined for device '{target_device_name}'."
 
+            # Use final_value (which is just value for enum in parse_value)
             if final_value not in allowed_enum:
                 enum_match = fuzz_process.extractOne(final_value, allowed_enum, scorer=fuzz.token_sort_ratio, score_cutoff=75)
                 if enum_match:
@@ -395,8 +336,8 @@ def set_device_attribute(
                 payload_dict = {mqtt_attribute_name: final_value}
                 final_value_repr = str(final_value)
 
-        else:
-            logger.warning(f"Attribute '{cap_name_from_expose}' with unhandled type '{cap_type}' for device '{target_device_name}'. Value: '{value}'")
+        else: # Includes 'string' type
+            logger.warning(f"Attribute '{cap_name_from_expose}' with unhandled or simple type '{cap_type}' for device '{target_device_name}'. Value: '{value}'")
             # Try sending the raw value as a last resort if it's just 'string' type?
             if cap_type == "string":
                  payload_dict = {mqtt_attribute_name: value}
@@ -406,28 +347,21 @@ def set_device_attribute(
                  return f"Sorry, I don't have specific instructions for setting the attribute '{cap_name_from_expose}' (type: {cap_type})."
 
 
-    # --- 6. Send Command if payload was generated ---
+    # --- 6. Send Command ---
     if payload_dict is None:
         logger.error(f"Payload dictionary was not generated for attribute '{cap_name_from_expose}' with value '{value}' on device '{target_device_name}'. This indicates a logic error.")
         return f"Internal error: Could not process the request to set '{cap_name_from_expose}' to '{value}' for '{target_device_name}'."
 
     payload_json = json.dumps(payload_dict)
+    # Ensure settings are imported correctly
     topic = f"{settings.mqtt_broker.default_topic_base}/{target_device_name}/set"
 
     logger.info(f"Attempting to set attribute '{mqtt_attribute_name}' for device '{target_device_name}'. Topic: {topic}, Payload: {payload_json}")
 
+    # Ensure mqtt_client is imported correctly
     success = mqtt_client.schedule_publish(topic, payload_json, qos=1)
 
     if success:
-        # Use the potentially more descriptive final_value_repr
         return f"Okay, done. '{target_device_name}' {cap_name_from_expose} set to {final_value_repr}."
     else:
         return f"Sorry, there was an issue sending the command to set '{cap_name_from_expose}' for '{target_device_name}'."
-
-
-TOOLS: List = [
-    set_device_attribute,
-    say_to_console,
-    manage_mem,
-    search_mem
-]
