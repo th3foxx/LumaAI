@@ -105,7 +105,7 @@ class AISettings:
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
-    online_mode: bool = bool(os.getenv("AI_ONLINE_MODE", True))
+    online_mode: bool = bool(os.getenv("AI_ONLINE_MODE", False))
 
 
 @dataclass(frozen=True)
