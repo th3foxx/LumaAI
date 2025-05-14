@@ -105,7 +105,7 @@ class AISettings:
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
-    online_mode: bool = bool(os.getenv("AI_ONLINE_MODE", False))
+    online_mode: bool = bool(os.getenv("AI_ONLINE_MODE", True))
 
 
 @dataclass(frozen=True)
@@ -131,6 +131,19 @@ class RasaNLUSettings:
 
 
 @dataclass(frozen=True)
+class LocalAudioSettings:
+    """Настройки локального аудио на устройстве."""
+    enabled: bool = bool(os.getenv("LOCAL_AUDIO_ENABLED", "True").lower() in ("true", "1", "t")) # По умолчанию выключено
+    input_device_index: Optional[int] = int(os.getenv("LOCAL_AUDIO_INPUT_DEVICE")) if os.getenv("LOCAL_AUDIO_INPUT_DEVICE") else None
+    output_device_index: Optional[int] = int(os.getenv("LOCAL_AUDIO_OUTPUT_DEVICE")) if os.getenv("LOCAL_AUDIO_OUTPUT_DEVICE") else None
+    # Используем те же параметры, что и для веб-аудио
+    sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", 16000))
+    frame_length: int = int(os.getenv("AUDIO_FRAME_LENGTH", 512))
+    channels: int = int(os.getenv("AUDIO_CHANNELS", 1))
+    tts_output_sample_rate: int = int(os.getenv("PAROLI_PCM_SAMPLE_RATE", 22050)) # Sample rate for TTS output
+
+
+@dataclass(frozen=True)
 class Settings:
     """Главный объект конфигурации приложения."""
     picovoice: PicovoiceSettings = field(default_factory=PicovoiceSettings)
@@ -144,6 +157,7 @@ class Settings:
     ai: AISettings = field(default_factory=AISettings)
     mqtt_broker: MqttBrokerSettings = field(default_factory=MqttBrokerSettings)
     rasa_nlu: RasaNLUSettings = field(default_factory=RasaNLUSettings)
+    local_audio: LocalAudioSettings = field(default_factory=LocalAudioSettings)
 
 
 # Единая точка доступа к настройкам

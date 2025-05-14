@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import struct
+import threading
 import websockets
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +29,8 @@ from mqtt_client import startup_mqtt_client, shutdown_mqtt_client
 from connectivity import is_internet_available
 from offline_controller import parse_offline_command, execute_offline_command
 
+from local_audio import LocalAudioManager
+
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -37,6 +41,7 @@ cobra: pvcobra.Cobra | None = None
 vosk_model: VoskModel | None = None
 paroli_server_process = None
 paroli_log_reader_task = None
+local_audio_manager: LocalAudioManager | None = None # Add global ref
 
 # --- Paroli Server Management ---
 
@@ -148,8 +153,19 @@ async def stop_paroli_server():
         logger.info("Paroli server process not running or already stopped.")
 
 
+# --- Local Audio Shutdown Helper ---
+async def shutdown_local_audio():
+    """Shutdown local audio manager."""
+    global local_audio_manager
+    if local_audio_manager and local_audio_manager.is_enabled:
+        logger.info("Shutting down local audio manager...")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, local_audio_manager.shutdown)
+        logger.info("Local audio manager shutdown sequence initiated.")
+
+
 def initialize_resources():
-    global porcupine, cobra, vosk_model
+    global porcupine, cobra, vosk_model, local_audio_manager, manager # Ensure manager is global if accessed in lifespan startup
     logger.info("Initializing resources...")
     try:
         # Picovoice Porcupine (Wake Word)
@@ -186,6 +202,22 @@ def initialize_resources():
             logger.info(f"Vosk model loaded from {settings.vosk.model_path}. Sample rate expected: {settings.vosk.sample_rate}")
             if settings.vosk.sample_rate != settings.audio.sample_rate:
                  logger.warning(f"Vosk expected sample rate ({settings.vosk.sample_rate}) != configured rate ({settings.audio.sample_rate}). Recognition quality may suffer.")
+        
+        # --- Initialize Connection Manager FIRST ---
+        # Needed by LocalAudioManager callback and lifespan startup logic
+        manager = ConnectionManager() # Initialize manager here
+        logger.info("ConnectionManager initialized.")
+
+        # --- Initialize Local Audio Manager ---
+        main_loop = asyncio.get_event_loop()
+        async def process_audio_wrapper(audio_chunk: bytes):
+             await manager.process_audio(audio_chunk, ASSISTANT_THREAD_ID)
+
+        local_audio_manager = LocalAudioManager(process_audio_wrapper, main_loop)
+        if local_audio_manager.is_enabled:
+            logger.info("Local audio manager initialized.")
+        else:
+            logger.info("Local audio manager is disabled or failed to initialize.")
 
 
         # Paroli Server Sanity Check
@@ -209,19 +241,49 @@ def initialize_resources():
         logger.error(f"Error initializing resources: {e}", exc_info=True)
         raise # Critical failure
 
+
+# --- Lifespan Context Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # === Startup Phase ===
+    logger.info("Starting lifespan startup phase...")
+    # 1. Initialize Core Resources (Non-async ok here)
+    initialize_resources() # Initializes Vosk, Pico, LocalAudio, Manager
+
+    # 2. Start Background Services (Async)
+    await start_paroli_server()
+    await startup_mqtt_client()
+
+    # 3. Start Local Audio Interface (if needed) - Moved from old startup_event
+    await asyncio.sleep(0.1) # Keep short delay
+    global local_audio_manager, manager
+    if local_audio_manager and local_audio_manager.is_enabled and not manager.is_websocket_active:
+        logger.info("No active WebSocket connection on startup, starting local audio interface.")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, local_audio_manager.start_output)
+        await loop.run_in_executor(None, local_audio_manager.start_input)
+        manager.state = "wakeword" # Set initial state for local interface
+        logger.info("Local audio interface activated, waiting for wake word.")
+    elif local_audio_manager and local_audio_manager.is_enabled and manager.is_websocket_active:
+         logger.info("WebSocket connection already active on startup, local audio input remains paused.")
+
+    logger.info("Lifespan startup phase complete.")
+
+    yield # Application runs here
+
+    # === Shutdown Phase ===
+    logger.info("Starting lifespan shutdown phase...")
+    await stop_paroli_server()
+    await shutdown_mqtt_client()
+    close_llm_resources()
+    await shutdown_local_audio()
+    logger.info("Lifespan shutdown phase complete.")
+
+
 # --- FastAPI App ---
 app = FastAPI(
     title="Lumi Voice Assistant Backend",
-    on_startup=[
-        initialize_resources,
-        start_paroli_server,
-        startup_mqtt_client
-    ],
-    on_shutdown=[
-        stop_paroli_server,
-        shutdown_mqtt_client,
-        close_llm_resources # Закрываем ресурсы LLM при выходе
-    ],
+    lifespan=lifespan # <--- USE LIFESPAN INSTEAD OF on_startup/on_shutdown
 )
 
 # Mount static files
@@ -250,8 +312,10 @@ class ConnectionManager:
         self.silence_frames: int = 0
         self.frames_processed_in_listening: int = 0
         self.llm_tts_task: asyncio.Task | None = None # Task for background LLM/TTS
+        self.is_websocket_active: bool = False # <<< ADDED FLAG
 
     async def connect(self, websocket: WebSocket):
+        global local_audio_manager # Access global manager
         if self.websocket is not None and self.websocket.client_state == WebSocketState.CONNECTED:
             logger.warning("New connection attempt while another is active. Closing new connection.")
             await websocket.accept() # Accept then immediately close
@@ -265,6 +329,16 @@ class ConnectionManager:
         self.silence_frames = 0
         self.frames_processed_in_listening = 0
         self.llm_tts_task = None # Ensure no lingering task
+        self.is_websocket_active = True # <<< SET FLAG TO TRUE
+
+         # Pause local audio input if it's running
+        if local_audio_manager and local_audio_manager.is_enabled:
+             logger.info("WebSocket connected, pausing local audio input.")
+             # Run blocking pause in executor
+             loop = asyncio.get_running_loop()
+             await loop.run_in_executor(None, local_audio_manager.pause_input)
+             # Also stop any potential local TTS playback immediately
+             await loop.run_in_executor(None, local_audio_manager.stop_output)
 
         # Initialize Vosk recognizer for the connection
         if not vosk_model:
@@ -285,6 +359,7 @@ class ConnectionManager:
         return True
 
     async def disconnect(self, code: int = 1000, reason: str = "Client disconnected"):
+        global local_audio_manager # Access global manager
         if self.llm_tts_task and not self.llm_tts_task.done():
             logger.warning("Client disconnected during LLM/TTS processing. Cancelling task.")
             self.llm_tts_task.cancel()
@@ -316,6 +391,23 @@ class ConnectionManager:
         self.frames_processed_in_listening = 0
         logger.info("Client disconnected and resources cleaned.")
 
+        # Resume local audio input if it exists and is enabled
+        if local_audio_manager and local_audio_manager.is_enabled:
+            logger.info("WebSocket disconnected, resuming local audio input.")
+            # Run blocking resume/start in executor
+            loop = asyncio.get_running_loop()
+            # Ensure output is ready for potential local TTS later
+            await loop.run_in_executor(None, local_audio_manager.start_output)
+            # Resume input listening
+            await loop.run_in_executor(None, local_audio_manager.resume_input)
+            # If input wasn't running before, start it now
+            if not local_audio_manager._is_input_running:
+                 await loop.run_in_executor(None, local_audio_manager.start_input)
+            # Optionally, reset state to wakeword for local interface
+            self.state = "wakeword"
+            logger.info("Local audio interface activated, waiting for wake word.")
+            # Note: No status message sent as there's no WebSocket
+
     async def _send_json(self, data: dict):
         """Internal helper to send JSON safely."""
         if self.websocket and self.websocket.client_state == WebSocketState.CONNECTED:
@@ -342,57 +434,65 @@ class ConnectionManager:
          })
 
     async def send_tts_chunk(self, audio_chunk_b64: str):
-        await self._send_json({
-            "type": "tts_chunk",
-            "data": audio_chunk_b64,
-        })
+        """Sends TTS chunk to WebSocket if active."""
+        if self.is_websocket_active:
+            await self._send_json({
+                "type": "tts_chunk",
+                "data": audio_chunk_b64,
+            })
 
     async def send_tts_finished(self):
-        await self._send_json({"type": "tts_finished"})
-        logger.info("Sent TTS finished signal to client.")
+        """Sends TTS finished signal to WebSocket if active."""
+        if self.is_websocket_active:
+            await self._send_json({"type": "tts_finished"})
+            logger.info("Sent TTS finished signal to client (WebSocket).")
 
     async def send_error(self, error_message: str):
-        logger.error(f"Sending error to client: {error_message}")
-        await self._send_json({"type": "error", "message": error_message})
+        """Sends error message to WebSocket if active."""
+        logger.error(f"Sending error: {error_message}")
+        if self.is_websocket_active:
+            await self._send_json({"type": "error", "message": error_message})
 
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
         """
-        Runs LLM+TTS if online, otherwise attempts offline command parsing and execution.
+        Runs LLM+TTS/Offline. Sends status/TTS to WebSocket OR plays TTS locally.
         """
+        global local_audio_manager # Access global manager
         logger.info(f"Starting background task for text: '{text[:50]}...'")
         response_text = "" # Text to be spoken back to the user
+        tts_audio_bytes = bytearray() # Buffer for local TTS playback
+        was_online_request = False # Track if online resources were needed
 
         try:
-            # 1. Send initial processing status
-            await self.send_status("processing_started", "Thinking...")
-            self.state = "processing" # Update state
+            # 1. Send initial processing status (only if WS active)
+            if self.is_websocket_active:
+                await self.send_status("processing_started", "Thinking...")
+            else:
+                 logger.info("Processing request (local)...") # Log for local
+            self.state = "processing" # Update state regardless of interface
 
             # 2. Check Internet Connectivity
             online = await is_internet_available()
+            was_online_request = online and settings.ai.online_mode
 
             if online and settings.ai.online_mode:
                 # --- ONLINE: Use LLM ---
+                # ... (LLM logic - no changes) ...
                 logger.info("Internet available. Using LLM.")
-                # Call LLM (uses run_in_executor internally via LangGraph)
                 lumi_response = await ask_lumi(text, thread_id=thread_id)
                 logger.info(f"LLM response received: '{lumi_response[:50]}...'")
-
                 if not lumi_response:
                      logger.warning("LLM returned an empty response.")
                      response_text = "Sorry, I didn't get a response from the assistant."
                 else:
                      response_text = lumi_response
-
             else:
-                # --- OFFLINE: Use Rasa NLU API ---
-                logger.info("Internet unavailable. Attempting offline command processing via Rasa NLU API.")
-                # --- ИЗМЕНЕНИЕ ЗДЕСЬ: ДОБАВИТЬ await ---
+                # --- OFFLINE: Use Rasa NLU API or other logic ---
+                # ... (Offline logic - no changes) ...
+                logger.info("Internet unavailable or AI offline mode. Attempting offline command processing.")
                 parsed_command = await parse_offline_command(text)
-                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
-                if parsed_command: # Теперь parsed_command будет словарем или None
+                if parsed_command:
                     logger.info(f"Offline command parsed via API: {parsed_command}")
-                    # Execute the command via MQTT
                     execution_result = await execute_offline_command(parsed_command)
                     logger.info(f"Offline command execution result: {execution_result}")
                     response_text = execution_result
@@ -400,38 +500,64 @@ class ConnectionManager:
                     logger.warning(f"Offline command parsing via API failed for text: '{text}'")
                     response_text = "Sorry, I couldn't understand that command while offline."
 
-            # 3. Synthesize and Send Response (if any)
+
+            # 3. Synthesize Response (if any) and Send/Play
             if response_text:
-                await self.send_status("speaking_started", "Speaking...")
+                if self.is_websocket_active:
+                    await self.send_status("speaking_started", "Speaking...")
+                else:
+                    logger.info("Synthesizing response for local playback...")
                 self.state = "speaking" # Update state
-                await self.synthesize_and_send_tts(response_text) # Handles streaming TTS chunks
+
+                # Call synthesis, which now handles routing internally
+                tts_audio_bytes = await self.synthesize_and_route_tts(response_text)
+
+                # If local audio is active and we got bytes, play them
+                if not self.is_websocket_active and local_audio_manager and local_audio_manager.is_enabled and tts_audio_bytes:
+                    logger.info(f"Queueing {len(tts_audio_bytes)} bytes for local TTS playback.")
+                    # Run blocking play call in executor
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, local_audio_manager.play_tts_bytes, tts_audio_bytes)
+                    logger.info("Local TTS playback queued.")
+                elif not self.is_websocket_active and not tts_audio_bytes:
+                     logger.warning("TTS synthesis finished but produced no audio bytes for local playback.")
+
             else:
-                 # No response text generated (e.g., empty LLM response and no error message)
                  logger.warning("No response text generated to speak.")
-                 # Go back to listening state directly
+                 # Go back to listening state directly (for either interface)
                  self.state = "wakeword"
-                 await self.send_status("wakeword_listening", "Waiting for wake word...")
+                 if self.is_websocket_active:
+                     await self.send_status("wakeword_listening", "Waiting for wake word...")
+                 else:
+                     logger.info("Waiting for wake word (local)...")
 
 
         except asyncio.CancelledError:
              logger.info("LLM/TTS/Offline background task was cancelled.")
-             # State might be processing or speaking, force back to wakeword if client still connected
              if self.state != "disconnected":
                 self.state = "wakeword"
-                await self.send_status("wakeword_listening", "Processing cancelled. Waiting for wake word...")
+                if self.is_websocket_active:
+                    await self.send_status("wakeword_listening", "Processing cancelled. Waiting for wake word...")
+                else:
+                    logger.info("Processing cancelled. Waiting for wake word (local)...")
         except Exception as e:
             logger.error(f"Error during LLM/TTS/Offline processing in background task: {e}", exc_info=True)
-            await self.send_error(f"Error processing request: {str(e)}")
-            # Go back to listening state after error
+            await self.send_error(f"Error processing request: {str(e)}") # Sends only if WS active
             if self.state != "disconnected":
                 self.state = "wakeword"
-                await self.send_status("wakeword_listening", "Error occurred. Waiting for wake word...")
+                if self.is_websocket_active:
+                    await self.send_status("wakeword_listening", "Error occurred. Waiting for wake word...")
+                else:
+                    logger.info("Error occurred. Waiting for wake word (local)...")
         finally:
-            # Ensure state is reset correctly if the task finishes normally or with non-critical errors handled within synthesize_and_send_tts
-            if self.state not in ["disconnected", "wakeword"]: # If not already reset by error or cancellation
+            # Ensure state is reset correctly
+            if self.state not in ["disconnected", "wakeword"]:
                  logger.info("LLM/TTS/Offline background task finished. Returning to wakeword state.")
                  self.state = "wakeword"
-                 await self.send_status("wakeword_listening", "Waiting for wake word...")
+                 if self.is_websocket_active:
+                     await self.send_status("wakeword_listening", "Waiting for wake word...")
+                 else:
+                      logger.info("Waiting for wake word (local)...")
             self.llm_tts_task = None # Clear the task reference
 
 
@@ -440,6 +566,30 @@ class ConnectionManager:
             if self.state in ["processing", "speaking"]:
                 # logger.debug("Ignoring audio chunk while processing or speaking.")
                 return # Ignore audio while assistant is busy
+            
+             # --- Ensure Recognizer Exists --- <--- ADD THIS BLOCK
+            global vosk_model # Need access to the global model
+            if not self.recognizer and vosk_model:
+                 logger.info("Initializing Vosk recognizer instance...")
+                 try:
+                      # Ensure vosk_model is valid before creating recognizer
+                      if vosk_model:
+                           self.recognizer = KaldiRecognizer(vosk_model, settings.vosk.sample_rate)
+                           self.recognizer.SetWords(False)
+                           logger.info("Vosk recognizer instance created successfully.")
+                      else:
+                           # This case should ideally be caught during startup, but double-check
+                           logger.error("Vosk model is None, cannot create recognizer instance.")
+                           if self.is_websocket_active:
+                                await self.send_error("Internal server error: STT model not loaded.")
+                           return # Cannot proceed without a recognizer
+
+                 except Exception as e:
+                      logger.error(f"Failed to create Vosk recognizer instance: {e}", exc_info=True)
+                      if self.is_websocket_active:
+                           await self.send_error("Internal server error: STT engine failed to initialize.")
+                      # If recognizer fails, we can't proceed
+                      return
 
             if not self.recognizer or not porcupine or not cobra:
                 logger.error("Required resources (Vosk, Porcupine, Cobra) not available.")
@@ -469,6 +619,7 @@ class ConnectionManager:
             if self.state == "wakeword":
                 # --- Wake Word Detection ---
                 try:
+                    pcm = struct.unpack_from(f"{settings.audio.frame_length}h", audio_chunk) # Unpack here
                     keyword_index = porcupine.process(pcm)
                     if keyword_index >= 0:
                         logger.info("Wake word detected!")
@@ -476,14 +627,30 @@ class ConnectionManager:
                         self.audio_buffer.clear()
                         self.silence_frames = 0
                         self.frames_processed_in_listening = 0
-                        self.recognizer.Reset() # Reset Vosk for new utterance
-                        await self.send_status("listening_started", "Listening...")
+                        if self.recognizer: self.recognizer.Reset() # Reset Vosk
+                        if self.is_websocket_active:
+                            await self.send_status("listening_started", "Listening...")
+                        else:
+                             logger.info("Listening (local)...") # Log for local interface
                 except pvporcupine.PorcupineError as e:
                     logger.error(f"Porcupine processing error: {e}")
                     await self.send_error("Wake word engine error.")
                     # Remain in wakeword state
+                except struct.error as e:
+                     logger.error(f"Error unpacking audio chunk for Porcupine: {e}. Chunk length: {len(audio_chunk)}")
+                     return # Can't proceed without unpacking
 
             elif self.state == "listening":
+                try:
+                    pcm = struct.unpack_from(f"{settings.audio.frame_length}h", audio_chunk) # Unpack for Cobra too
+                except struct.error as e:
+                    logger.error(f"Error unpacking audio chunk for VAD/STT: {e}. Chunk length: {len(audio_chunk)}")
+                    # Maybe revert to wakeword state on unpacking error?
+                    self.state = "wakeword"
+                    if self.is_websocket_active: await self.send_status("wakeword_listening", "Audio error. Waiting for wake word...")
+                    else: logger.info("Audio error. Waiting for wake word (local)...")
+                    return
+                
                 self.frames_processed_in_listening += 1
                 self.audio_buffer.extend(audio_chunk) # Keep buffering in case needed later
 
@@ -498,7 +665,7 @@ class ConnectionManager:
                     partial_result_json = self.recognizer.PartialResult()
                     partial_result = json.loads(partial_result_json)
                     partial_transcript = partial_result.get("partial", "")
-                    if partial_transcript:
+                    if partial_transcript and self.is_websocket_active: # Only send partial to WS
                         await self.send_transcript(partial_transcript, is_final=False)
 
                     # --- Process with Cobra VAD ---
@@ -511,6 +678,8 @@ class ConnectionManager:
                          await self.send_error("VAD engine error.")
                          self.state = "wakeword" # Revert state on VAD error
                          await self.send_status("wakeword_listening", "Error occurred. Waiting for wake word...")
+                         if self.is_websocket_active: await self.send_status("wakeword_listening", "VAD Error. Waiting for wake word...")
+                         else: logger.info("VAD Error. Waiting for wake word (local)...")
                          return # Stop processing this chunk
 
                     # --- VAD Logic ---
@@ -541,34 +710,35 @@ class ConnectionManager:
                         logger.info(f"Final Transcript: '{final_transcript}'")
 
                         # Send final transcript (even if empty, client might want to know)
-                        await self.send_transcript(final_transcript, is_final=True)
+                        if self.is_websocket_active: # Send final transcript only to WS
+                            await self.send_transcript(final_transcript, is_final=True)
 
                         # --- Trigger LLM/TTS or go back to Wakeword ---
                         if final_transcript:
-                            # **** DECOUPLING ****
-                            # Cancel any previous task just in case (shouldn't happen often)
                             if self.llm_tts_task and not self.llm_tts_task.done():
-                                 logger.warning("Starting new LLM/TTS while previous one was still running. Cancelling old task.")
+                                 logger.warning("Starting new processing while previous one was still running. Cancelling old task.")
                                  self.llm_tts_task.cancel()
 
-                            # Start LLM & TTS in background
-                            self.state = "wakeword" # Set state immediately back to allow potential wake word detection later
+                            # State change now happens inside _run_llm_tts_or_offline
+                            # Start background task
                             self.llm_tts_task = asyncio.create_task(
                                 self._run_llm_tts_or_offline(final_transcript, thread_id)
                             )
-                            # *DO NOT* await the task here. Let it run in the background.
-                            # Status updates ("processing", "speaking") are handled within the task.
-                            # For the user, it appears we are ready for the next command almost instantly.
-                            logger.info("Scheduled LLM/TTS processing in background task.")
-                            # No status sent here, _run_llm_and_tts sends "processing_started"
+                            logger.info("Scheduled LLM/TTS/Offline processing in background task.")
+                            # *Immediately* go back to wakeword state for responsiveness
+                            self.state = "wakeword"
+                            # Don't send status here, background task handles it
 
                         else:
                             # No transcript, just go back to wake word state
                             logger.info("Empty final transcript. Returning to wake word listening.")
                             self.state = "wakeword"
-                            await self.send_status("wakeword_listening", "Waiting for wake word...")
+                            if self.is_websocket_active:
+                                await self.send_status("wakeword_listening", "Waiting for wake word...")
+                            else:
+                                logger.info("Waiting for wake word (local)...")
 
-                        # Clear buffers after finalization
+                        # Clear buffers
                         self.audio_buffer.clear()
                         self.silence_frames = 0
                         self.frames_processed_in_listening = 0
@@ -577,23 +747,27 @@ class ConnectionManager:
                     logger.error(f"Error processing audio chunk in listening state: {e}", exc_info=True)
                     await self.send_error(f"Error processing audio: {str(e)}")
                     self.state = "wakeword" # Reset state on error
-                    await self.send_status("wakeword_listening", "Error occurred. Waiting for wake word...")
+                    if self.is_websocket_active: await self.send_status("wakeword_listening", "Error occurred. Waiting for wake word...")
+                    else: logger.info("Error occurred. Waiting for wake word (local)...")
                     # Clear buffers on error too
                     self.audio_buffer.clear()
                     self.silence_frames = 0
                     self.frames_processed_in_listening = 0
 
 
-    async def synthesize_and_send_tts(self, text: str):
+    async def synthesize_and_route_tts(self, text: str) -> bytes:
         """Synthesizes text using Paroli Server and streams audio chunks."""
-        if not self.websocket or self.websocket.client_state != WebSocketState.CONNECTED:
-            logger.warning("Client disconnected before TTS could be sent.")
-            return # Exit if client is gone
+        global local_audio_manager
+        all_tts_bytes = bytearray() # Accumulate bytes for local playback
+
+        is_initially_websocket_active = self.is_websocket_active and self.websocket and self.websocket.client_state == WebSocketState.CONNECTED
+
 
         if not settings.paroli_server.ws_url:
              logger.error("Paroli Server WebSocket URL not configured. Cannot synthesize TTS.")
-             await self.send_error("TTS server is not configured.")
-             return
+             if is_initially_websocket_active: # Send error only if WS was active initially
+                 await self.send_error("TTS server is not configured.")
+             return all_tts_bytes # Return empty
 
         tts_success = False
         chunks_sent_to_browser = 0
@@ -617,87 +791,93 @@ class ConnectionManager:
 
                 # Receive and forward audio chunks
                 while True:
-                    # Check browser connection before receiving from Paroli
-                    if not self.websocket or self.websocket.client_state != WebSocketState.CONNECTED:
-                        logger.warning("Client disconnected during TTS streaming from Paroli.")
-                        # Paroli connection will be closed by 'async with' automatically
-                        return # Stop processing
+                    # Check WebSocket status *inside* the loop for sending chunks
+                    is_websocket_still_active_for_sending = self.is_websocket_active and self.websocket and self.websocket.client_state == WebSocketState.CONNECTED
 
+                    message = None
                     try:
-                        # Timeout for receiving data from Paroli
-                        message = await asyncio.wait_for(paroli_ws.recv(), timeout=settings.paroli_server.receive_timeout) # Use setting
+                        message = await asyncio.wait_for(paroli_ws.recv(), timeout=settings.paroli_server.receive_timeout)
                     except asyncio.TimeoutError:
                         logger.error("Timeout waiting for message from Paroli Server.")
-                        await self.send_error("TTS server timed out.")
-                        break # Exit loop, close Paroli connection
+                        if is_websocket_still_active_for_sending: await self.send_error("TTS server timed out.")
+                        break
                     except websockets.exceptions.ConnectionClosedOK:
                         logger.info("Paroli Server closed connection cleanly.")
-                        if not tts_success: # If closed OK before final 'ok' status
+                        if not tts_success and is_websocket_still_active_for_sending:
                              logger.warning("Paroli connection closed OK before receiving final 'ok' status.")
                              await self.send_error("TTS stream ended unexpectedly (OK).")
-                        break # Exit loop
+                        break
                     except websockets.exceptions.ConnectionClosedError as e:
                         logger.error(f"Paroli Server connection closed unexpectedly: {e}")
-                        await self.send_error(f"TTS Server connection error: {e.reason}")
-                        break # Exit loop
+                        if is_websocket_still_active_for_sending: await self.send_error(f"TTS Server connection error: {e.reason}")
+                        break
                     except Exception as recv_err:
                         logger.error(f"Error receiving message from Paroli Server: {recv_err}", exc_info=True)
-                        await self.send_error("Error communicating with TTS server.")
-                        break # Exit loop
+                        if is_websocket_still_active_for_sending: await self.send_error("Error communicating with TTS server.")
+                        break
 
                     if isinstance(message, bytes):
                         if len(message) > 0:
-                            audio_chunk_b64 = base64.b64encode(message).decode('utf-8')
-                            await self.send_tts_chunk(audio_chunk_b64)
-                            chunks_sent_to_browser += 1
+                            all_tts_bytes.extend(message) # Always accumulate
+                            # Send only if WS is still active for sending
+                            if is_websocket_still_active_for_sending:
+                                audio_chunk_b64 = base64.b64encode(message).decode('utf-8')
+                                await self.send_tts_chunk(audio_chunk_b64)
+                                chunks_sent_to_browser += 1
                         else:
                             logger.warning("Received empty audio chunk from Paroli.")
                     elif isinstance(message, str):
-                        logger.info(f"Received final status from Paroli Server: {message}")
-                        try:
-                            status_data = json.loads(message)
-                            if status_data.get("status") == "ok":
-                                tts_success = True # Mark as successful
-                            else:
-                                error_msg = status_data.get("message", "Unknown TTS server error")
-                                logger.error(f"Paroli Server TTS failed: {error_msg}")
-                                await self.send_error(f"Text-to-Speech failed: {error_msg}")
-                        except json.JSONDecodeError:
-                            logger.error(f"Could not decode final status JSON from Paroli: {message}")
-                            await self.send_error("Received invalid final status from TTS server.")
-                        break # End receiving loop after final text message
+                         logger.info(f"Received final status from Paroli Server: {message}")
+                         try:
+                              status_data = json.loads(message)
+                              if status_data.get("status") == "ok":
+                                   tts_success = True
+                              else:
+                                   error_msg = status_data.get("message", "Unknown TTS server error")
+                                   logger.error(f"Paroli Server TTS failed: {error_msg}")
+                                   if is_websocket_still_active_for_sending: await self.send_error(f"Text-to-Speech failed: {error_msg}")
+                         except json.JSONDecodeError:
+                              logger.error(f"Could not decode final status JSON from Paroli: {message}")
+                              if is_websocket_still_active_for_sending: await self.send_error("Received invalid final status from TTS server.")
+                         break # End receiving loop
                     else:
                         logger.warning(f"Received unexpected message type from Paroli Server: {type(message)}")
 
-            # After 'async with' block (Paroli connection is closed)
+            # After Paroli connection is closed
+            # Check final WS state for sending the finished signal
+            is_websocket_still_active_for_finish_signal = self.is_websocket_active and self.websocket and self.websocket.client_state == WebSocketState.CONNECTED
             if tts_success:
-                if chunks_sent_to_browser == 0:
-                    logger.warning("Paroli finished OK but sent no audio chunks.")
-                # Send the final signal *after* Paroli connection is closed and loop finishes
-                await self.send_tts_finished()
+                 if is_websocket_still_active_for_finish_signal and chunks_sent_to_browser == 0 and len(all_tts_bytes) > 0:
+                     logger.warning("Paroli finished OK but sent no chunks to browser (maybe disconnected during?).")
+                 elif is_websocket_still_active_for_finish_signal and len(all_tts_bytes) > 0:
+                      await self.send_tts_finished() # Send finished signal
+                 # Check original state for local playback warning
+                 elif not is_initially_websocket_active and len(all_tts_bytes) == 0:
+                      logger.warning("Paroli finished OK but produced no audio bytes for local playback.")
             else:
-                 logger.warning("TTS process finished without a success status from Paroli.")
-                 # Error should have been sent already in the loop
+                  logger.warning("TTS process finished without a success status from Paroli.")
 
-            logger.info(f"Finished streaming TTS audio ({chunks_sent_to_browser} chunks). Success: {tts_success}")
+            logger.info(f"Finished TTS processing. Success: {tts_success}. Bytes generated: {len(all_tts_bytes)}. Chunks sent to WS: {chunks_sent_to_browser}")
 
         except websockets.exceptions.InvalidURI:
-            logger.error(f"Invalid Paroli Server WebSocket URL: {settings.paroli_server.ws_url}")
-            await self.send_error("Invalid TTS server address configured.")
+             logger.error(f"Invalid Paroli Server WebSocket URL: {settings.paroli_server.ws_url}")
+             if is_initially_websocket_active: await self.send_error("Invalid TTS server address configured.")
         except ConnectionRefusedError:
              logger.error(f"Connection refused by Paroli Server at {settings.paroli_server.ws_url}. Is it running?")
-             await self.send_error("Could not connect to Text-to-Speech server.")
-        except asyncio.TimeoutError: # Connection timeout
+             if is_initially_websocket_active: await self.send_error("Could not connect to Text-to-Speech server.")
+        except asyncio.TimeoutError: # Connection timeout connecting to Paroli
              logger.error(f"Timeout connecting to Paroli Server at {settings.paroli_server.ws_url}.")
-             await self.send_error("Timeout connecting to Text-to-Speech server.")
+             if is_initially_websocket_active: await self.send_error("Timeout connecting to Text-to-Speech server.")
         except Exception as e:
             logger.error(f"Paroli Server TTS Error: {e}", exc_info=True)
-            await self.send_error(f"Text-to-Speech error: {str(e)}")
-        # finally:
-            # **REMOVED**: State transition is now handled by the caller (_run_llm_and_tts)
+             # Send error only if WS was active when the error likely occurred
+            if is_initially_websocket_active:
+                 await self.send_error(f"Text-to-Speech error: {str(e)}")
+        finally:
+            # Always return the accumulated bytes
+            return bytes(all_tts_bytes)
 
 
-manager = ConnectionManager()
 
 # Use a fixed thread_id for the single assistant session
 ASSISTANT_THREAD_ID = "lumi-voice-assistant-session"
@@ -705,9 +885,20 @@ ASSISTANT_THREAD_ID = "lumi-voice-assistant-session"
 @app.websocket("/ws") # Removed client_id from path
 async def websocket_endpoint(websocket: WebSocket):
     """Handles the single WebSocket connection for the voice assistant."""
+    global manager
+    if not manager: # Check manager is initialized
+        logger.error("Connection Manager not initialized before WebSocket connection attempt.")
+        # Accept and close gracefully if manager isn't ready
+        try:
+            await websocket.accept()
+            await websocket.close(code=1011, reason="Server not ready")
+        except Exception as e:
+             logger.error(f"Error accepting/closing websocket when manager not ready: {e}")
+        return
+
     connected = await manager.connect(websocket)
     if not connected:
-        return # Connection was rejected or failed
+        return
 
     try:
         while True:
@@ -737,7 +928,8 @@ async def websocket_endpoint(websocket: WebSocket):
         # Try to send error before disconnecting if possible
         await manager.send_error(f"Unexpected WebSocket error: {str(e)}")
     finally:
-        await manager.disconnect()
+        if manager: # Check if manager exists before calling disconnect
+            await manager.disconnect()
 
 
 # --- Run Server ---
@@ -752,5 +944,17 @@ if __name__ == "__main__":
             logger.info(f"Created directory for Vosk model: {vosk_dir}")
          except OSError as e:
             logger.error(f"Could not create Vosk model directory {vosk_dir}: {e}")
+    
+    logger.info(f"Local audio enabled via settings: {settings.local_audio.enabled}")
+    # List devices at startup for easier debugging
+    if settings.local_audio.enabled:
+        try:
+            import sounddevice as sd
+            logger.info("Available Audio Devices:")
+            logger.info(f"\n{sd.query_devices()}")
+            logger.info(f"Using Input Device Index: {settings.local_audio.input_device_index if settings.local_audio.input_device_index is not None else 'Default'}")
+            logger.info(f"Using Output Device Index: {settings.local_audio.output_device_index if settings.local_audio.output_device_index is not None else 'Default'}")
+        except Exception as e:
+            logger.warning(f"Could not list audio devices on startup: {e}")
 
     uvicorn.run(app, host=settings.webapp.host, port=settings.webapp.port)
