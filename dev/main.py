@@ -16,6 +16,7 @@ from settings import settings, Settings # Import the main Settings class
 from connectivity import is_internet_available
 
 from tools.scheduler import init_db as init_scheduler_db
+from utils.music_db import init_music_likes_table
 from services.reminder_checker import start_reminder_checker, stop_reminder_checker
 # from offline_controller import parse_offline_command, execute_offline_command # Now part of NLU engine
 
@@ -264,6 +265,7 @@ async def lifespan(app: FastAPI):
     # Initialize scheduler database
     try:
         init_scheduler_db() # Call the DB init function from tools.scheduler
+        init_music_likes_table() # <--- Для music_data.db (таблица liked_songs)
     except Exception as e:
         logger.error(f"Failed to initialize scheduler database: {e}. Reminders will not work.", exc_info=True)
         # Decide if this is a fatal error for your application

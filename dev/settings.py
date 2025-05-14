@@ -152,6 +152,12 @@ class TelegramSettings:
 
 
 @dataclass(frozen=True)
+class ToolsSettings:
+    """Настройки инструментов."""
+    weather_api_key: str = os.getenv("WEATHER_API_KEY", "YOUR_WEATHER_API_KEY_HERE")
+    weather_api_url: str = os.getenv("WEATHER_API_URL", "https://api.openweathermap.org/data/2.5/weather")
+
+@dataclass(frozen=True)
 class Settings:
     engines: EngineSelectorSettings = field(default_factory=EngineSelectorSettings)
     picovoice: PicovoiceSettings = field(default_factory=PicovoiceSettings)
@@ -166,7 +172,9 @@ class Settings:
     rasa_nlu: RasaNLUSettings = field(default_factory=RasaNLUSettings)
     sounddevice: SoundDeviceSettings = field(default_factory=SoundDeviceSettings)
     telegram: TelegramSettings = field(default_factory=TelegramSettings)
+    tools: ToolsSettings = field(default_factory=ToolsSettings)
     scheduler_db_path: str = os.getenv("SCHEDULER_DB_PATH", "reminders.db") # Make DB path configurable
+    music_db_path: str = os.getenv("MUSIC_DB_PATH", "music_data.db")
     scheduler_check_interval_seconds: int = int(os.getenv("SCHEDULER_CHECK_INTERVAL_SECONDS", 30)) # How often to check for due reminders
 
 

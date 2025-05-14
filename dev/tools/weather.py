@@ -5,11 +5,12 @@ from datetime import datetime
 from typing import Optional
 
 from langchain_core.tools import tool
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
-OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
-OPENWEATHERMAP_API_URL = "https://api.openweathermap.org/data/2.5/weather"
+OPENWEATHERMAP_API_KEY = settings.tools.weather_api_key
+OPENWEATHERMAP_API_URL = settings.tools.weather_api_url
 
 if not OPENWEATHERMAP_API_KEY:
     logger.warning(
