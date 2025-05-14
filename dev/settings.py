@@ -115,7 +115,7 @@ class AISettings: # For LLM/LangGraph
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
-    online_mode: bool = os.getenv("AI_ONLINE_MODE", "False").lower() in ("true", "1", "t")
+    online_mode: bool = os.getenv("AI_ONLINE_MODE", "True").lower() in ("true", "1", "t")
 
 
 @dataclass(frozen=True)
@@ -146,6 +146,12 @@ class SoundDeviceSettings: # For local audio I/O via sounddevice
 
 
 @dataclass(frozen=True)
+class TelegramSettings:
+    bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID") # User or group chat ID
+
+
+@dataclass(frozen=True)
 class Settings:
     engines: EngineSelectorSettings = field(default_factory=EngineSelectorSettings)
     picovoice: PicovoiceSettings = field(default_factory=PicovoiceSettings)
@@ -159,6 +165,9 @@ class Settings:
     mqtt_broker: MqttBrokerSettings = field(default_factory=MqttBrokerSettings)
     rasa_nlu: RasaNLUSettings = field(default_factory=RasaNLUSettings)
     sounddevice: SoundDeviceSettings = field(default_factory=SoundDeviceSettings)
+    telegram: TelegramSettings = field(default_factory=TelegramSettings)
+    scheduler_db_path: str = os.getenv("SCHEDULER_DB_PATH", "reminders.db") # Make DB path configurable
+    scheduler_check_interval_seconds: int = int(os.getenv("SCHEDULER_CHECK_INTERVAL_SECONDS", 30)) # How often to check for due reminders
 
 
 settings = Settings()

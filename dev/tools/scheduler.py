@@ -5,11 +5,12 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Dict, Any
 
 import dateparser # Needs installation: pip install dateparser
+from settings import settings
 from langchain_core.tools import tool
 
 # Assuming settings.py is accessible or define DB path here
 # from settings import settings # If settings has a DB path
-DB_PATH = "reminders.db" # Simple file-based database
+DB_PATH = settings.scheduler_db_path # Simple file-based database
 
 logger = logging.getLogger(__name__)
 

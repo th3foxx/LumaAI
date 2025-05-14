@@ -14,6 +14,9 @@ from starlette.websockets import WebSocketState
 # Project specific imports
 from settings import settings, Settings # Import the main Settings class
 from connectivity import is_internet_available
+
+from tools.scheduler import init_db as init_scheduler_db
+from services.reminder_checker import start_reminder_checker, stop_reminder_checker
 # from offline_controller import parse_offline_command, execute_offline_command # Now part of NLU engine
 
 # Engine imports
@@ -257,7 +260,26 @@ async def shutdown_global_engines():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase beginning...")
+
+    # Initialize scheduler database
+    try:
+        init_scheduler_db() # Call the DB init function from tools.scheduler
+    except Exception as e:
+        logger.error(f"Failed to initialize scheduler database: {e}. Reminders will not work.", exc_info=True)
+        # Decide if this is a fatal error for your application
+
     await initialize_global_engines(settings) # Pass the global settings object
+
+    # Start the reminder checker background task
+    # It needs references to tts_engine and audio_output_engine
+    global tts_engine, audio_output_engine # Ensure these are accessible
+    if tts_engine and audio_output_engine:
+         # Check if scheduler_db_path is set, otherwise reminder checker might not work well
+        if not settings.scheduler_db_path:
+            logger.warning("Scheduler DB path not set. Reminder checker might not function correctly.")
+        await start_reminder_checker(tts_engine, audio_output_engine)
+    else:
+        logger.warning("TTS or Audio Output engine not available, reminder checker not started.")
 
     # Start local audio if enabled and no WebSocket is immediately active
     # This logic is now partly in ConnectionManager's connect/disconnect
@@ -274,6 +296,7 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase complete.")
     yield
     logger.info("Lifespan: Shutdown phase beginning...")
+    await stop_reminder_checker() # Stop the reminder checker first
     await shutdown_global_engines()
     logger.info("Lifespan: Shutdown phase complete.")
 
