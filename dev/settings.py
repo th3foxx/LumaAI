@@ -25,6 +25,7 @@ class EngineSelectorSettings:
     audio_input_engine: str = os.getenv("AUDIO_INPUT_ENGINE", "sounddevice")
     audio_output_engine: str = os.getenv("AUDIO_OUTPUT_ENGINE", "sounddevice")
     communication_engine: str = os.getenv("COMMUNICATION_ENGINE", "mqtt")
+    offline_processor_engine: str = os.getenv("OFFLINE_PROCESSOR_ENGINE", "default")
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,7 @@ class AISettings: # For LLM/LangGraph
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
-    online_mode: bool = os.getenv("AI_ONLINE_MODE", "True").lower() in ("true", "1", "t")
+    online_mode: bool = os.getenv("AI_ONLINE_MODE", "False").lower() in ("true", "1", "t")
 
 
 @dataclass(frozen=True)

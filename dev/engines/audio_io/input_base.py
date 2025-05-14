@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Callable, Coroutine, Any
+from typing import Callable, Coroutine, Any, Dict
 
 ProcessAudioCallback = Callable[[bytes], Coroutine[Any, Any, None]]
 

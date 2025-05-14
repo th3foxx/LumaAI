@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, Dict, Any
 from langchain_core.messages import BaseMessage # For type hinting if returning full message
 
 class LLMLogicEngineBase(ABC):
