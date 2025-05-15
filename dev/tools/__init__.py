@@ -8,6 +8,7 @@ from .scheduler import schedule_reminder, list_reminders, cancel_reminder
 from .weather import get_current_weather
 from .web_search import search_web_jina
 from .time import get_current_time
+from .communication import send_message_to_contact, list_contacts
 from .music_control import (
     play_music,
     play_from_youtube,
@@ -34,6 +35,8 @@ TOOLS: List = [
     cancel_reminder,
     get_current_time,
     get_current_weather,
+    send_message_to_contact,
+    list_contacts,
     search_web_jina,
     play_music,
     play_from_youtube,
@@ -62,6 +65,8 @@ __all__ = [
     "cancel_reminder",
     "get_current_time",
     "get_current_weather",
+    "send_message_to_contact",
+    "list_contacts",
     "search_web_jina",
     "play_music",
     "play_from_youtube",

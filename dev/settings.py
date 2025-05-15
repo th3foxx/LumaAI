@@ -1,8 +1,12 @@
 import os
+import json
+import logging
 from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Dict
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -148,7 +152,16 @@ class SoundDeviceSettings: # For local audio I/O via sounddevice
 @dataclass(frozen=True)
 class TelegramSettings:
     bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID") # User or group chat ID
+    chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
+    
+    # Настройки для Client API (отправка от вашего имени)
+    client_api_id: Optional[int] = int(os.getenv("TELEGRAM_CLIENT_API_ID")) if os.getenv("TELEGRAM_CLIENT_API_ID") else None
+    client_api_hash: Optional[str] = os.getenv("TELEGRAM_CLIENT_API_HASH")
+    client_session_name: str = os.getenv("TELEGRAM_CLIENT_SESSION_NAME", "my_assistant_session") # Имя файла сессии
+    # Номер телефона, с которого будет идти отправка.
+    # Может потребоваться для первой авторизации, если сессия не найдена.
+    # Можно также запрашивать интерактивно при первом запуске.
+    client_phone_number: Optional[str] = os.getenv("TELEGRAM_CLIENT_PHONE_NUMBER")
 
 
 @dataclass(frozen=True)
@@ -158,6 +171,53 @@ class ToolsSettings:
     weather_api_url: str = os.getenv("WEATHER_API_URL", "https://api.openweathermap.org/data/2.5/weather")
     jina_search_api_url: str = os.getenv("JINA_SEARCH_API_URL", "https://s.jina.ai/")
     jina_search_api_key: str = os.getenv("JINA_SEARCH_API_KEY", "YOUR_JINA_SEARCH_API_KEY_HERE")
+
+
+@dataclass(frozen=True)
+class SMTPMailSettings:
+    host: Optional[str] = os.getenv("SMTP_HOST")
+    port: int = int(os.getenv("SMTP_PORT", 587)) # 587 для TLS, 465 для SSL
+    username: Optional[str] = os.getenv("SMTP_USERNAME")
+    password: Optional[str] = os.getenv("SMTP_PASSWORD")
+    use_tls: bool = os.getenv("SMTP_USE_TLS", "True").lower() in ("true", "1", "t")
+    # sender_email: От чьего имени слать. Если совпадает с username, можно не указывать отдельно.
+    # Если отличается, то ваш SMTP сервер должен разрешать отправку от этого имени.
+    sender_email: Optional[str] = os.getenv("SMTP_SENDER_EMAIL", os.getenv("SMTP_USERNAME"))
+
+
+@dataclass(frozen=True)
+class ContactSettings:
+    contacts_file_path: str = os.getenv("CONTACTS_FILE_PATH", "contacts.json")
+    _contacts_data: Dict[str, Dict[str, str]] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self):
+        contacts = {}
+        if self.contacts_file_path:
+            try:
+                with open(self.contacts_file_path, 'r', encoding='utf-8') as f:
+                    loaded_contacts_raw = json.load(f)
+                    # Приводим ключи (имена контактов) к нижнему регистру при загрузке
+                    # для регистронезависимого поиска
+                    contacts = {str(k).lower(): v for k, v in loaded_contacts_raw.items()}
+                logger.info(f"Contacts loaded successfully from {self.contacts_file_path}. Found {len(contacts)} contacts.")
+            except FileNotFoundError:
+                logger.warning(f"Contacts file not found: {self.contacts_file_path}. No contacts will be available.")
+            except json.JSONDecodeError:
+                logger.error(f"Error decoding JSON from contacts file: {self.contacts_file_path}. Contacts not loaded.")
+            except Exception as e:
+                logger.error(f"Failed to load contacts from {self.contacts_file_path}: {e}. Contacts not loaded.")
+        else:
+            logger.warning("No contacts file path specified (CONTACTS_FILE_PATH). Contacts list will be empty.")
+        # Используем object.__setattr__ так как датакласс frozen=True
+        object.__setattr__(self, '_contacts_data', contacts)
+
+    def get_contact(self, name: str) -> Optional[Dict[str, str]]:
+        return self._contacts_data.get(name.lower())
+
+    @property
+    def available_contacts(self) -> List[str]:
+        return list(self._contacts_data.keys())
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -178,6 +238,8 @@ class Settings:
     scheduler_db_path: str = os.getenv("SCHEDULER_DB_PATH", "reminders.db") # Make DB path configurable
     music_db_path: str = os.getenv("MUSIC_DB_PATH", "music_data.db")
     scheduler_check_interval_seconds: int = int(os.getenv("SCHEDULER_CHECK_INTERVAL_SECONDS", 30)) # How often to check for due reminders
+    smtp_mail: SMTPMailSettings = field(default_factory=SMTPMailSettings)
+    contacts_config: ContactSettings = field(default_factory=ContactSettings)
 
 
 settings = Settings()
