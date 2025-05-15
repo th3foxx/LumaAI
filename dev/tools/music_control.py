@@ -42,37 +42,89 @@ async def _search_youtube_and_get_info(query: str) -> Optional[Dict[str, Any]]:
     logger.info(f"Searching YouTube with yt-dlp for: '{query}'")
     try:
         process = await asyncio.create_subprocess_exec(
-            'yt-dlp', '--skip-download', '--dump-single-json', '--default-search', 'ytsearch1:',
-            '--ignore-errors', '--no-warnings', '--format', 'bestaudio/best', query,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            'yt-dlp',
+            '--skip-download',
+            '--dump-single-json',
+            '--default-search', 'ytsearch1:', 
+            '--ignore-errors',
+            '--no-warnings',
+            '--format', 'bestaudio/best', # yt-dlp попытается выбрать лучший аудиопоток
+            query,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=20)
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=60)
+
         if process.returncode != 0:
             stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
             logger.error(f"yt-dlp search failed for '{query}' (code {process.returncode}). Stderr: {stderr_str}"); return None
+        
         if not stdout_bytes:
             logger.warning(f"yt-dlp returned no stdout for '{query}'. Stderr: {stderr_bytes.decode('utf-8', errors='ignore').strip()}"); return None
-        video_info = json.loads(stdout_bytes.decode('utf-8', errors='ignore'))
-        title = video_info.get('title', query); audio_url = video_info.get('url')
-        if not audio_url:
-            if 'formats' in video_info:
-                audio_formats = [f for f in video_info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
-                if not audio_formats: audio_formats = [f for f in video_info['formats'] if f.get('acodec') != 'none' and f.get('url')]
-                if audio_formats:
-                    preferred_exts = ('m4a', 'opus', 'webm', 'mp3')
-                    for ext in preferred_exts:
-                        for f_info in audio_formats:
-                            if f_info.get('ext') == ext: audio_url = f_info['url']; break
-                        if audio_url: break
-                    if not audio_url: audio_url = audio_formats[0]['url']
+
+        result_info = json.loads(stdout_bytes.decode('utf-8', errors='ignore'))
+        logger.debug(f"yt-dlp JSON output for '{query}': {json.dumps(result_info, indent=2, ensure_ascii=False)}")
+
+        video_data_to_process = None
+
+        if result_info.get("_type") == "playlist":
+            logger.debug(f"yt-dlp returned a playlist for query '{query}'. Processing first entry.")
+            if result_info.get("entries") and len(result_info["entries"]) > 0:
+                video_data_to_process = result_info["entries"][0] # Берем первое видео из плейлиста/канала
+            else:
+                logger.warning(f"Playlist/channel result for '{query}' has no entries.")
+                return None
+        else: # Предполагаем, что это информация об одном видео
+            video_data_to_process = result_info
+
+        if not video_data_to_process:
+            logger.warning(f"No video data to process from yt-dlp output for '{query}'.")
+            return None
+
+        title = video_data_to_process.get('title', query)
+        # yt-dlp с --format bestaudio/best должен сам выбрать лучший URL и поместить его в 'url'
+        # для ОБЪЕКТА ВИДЕО (не плейлиста).
+        audio_url = video_data_to_process.get('url') 
+
+        # Если 'url' нет на верхнем уровне video_data_to_process, или если мы хотим быть уверены,
+        # что это аудио, можно дополнительно проверить 'formats'.
+        # Но с '--format bestaudio/best' это часто избыточно, yt-dlp уже должен был выбрать.
+        if not audio_url and 'formats' in video_data_to_process:
+            logger.debug(f"No top-level 'url' in video data for '{title}', checking formats list...")
+            # (Ваша существующая логика выбора из 'formats' может остаться здесь как fallback)
+            audio_formats_available = []
+            for f_info in video_data_to_process['formats']:
+                if f_info.get('url') and f_info.get('acodec') and f_info.get('acodec') != 'none':
+                    audio_formats_available.append(f_info)
+            
+            only_audio_formats = [f for f in audio_formats_available if f.get('vcodec') == 'none']
+            target_formats_list = only_audio_formats if only_audio_formats else audio_formats_available
+
+            if target_formats_list:
+                preferred_exts = ('m4a', 'opus', 'webm', 'mp3')
+                for ext in preferred_exts:
+                    for f_info in target_formats_list:
+                        if f_info.get('ext') == ext: audio_url = f_info['url']; break
+                    if audio_url: break
+                if not audio_url: audio_url = target_formats_list[0]['url']
+        
         if audio_url:
-            video_id = video_info.get('id')
-            logger.info(f"Found YouTube result for '{query}': '{title}' (ID: {video_id}), URL: {audio_url[:50]}...")
-            return {"title": title, "url": audio_url, "uploader": video_info.get("uploader", "Unknown Uploader"), "video_id": video_id}
-        else: logger.warning(f"Could not extract a playable audio URL for '{query}' from yt-dlp output."); return None
+            video_id = video_data_to_process.get('id') # ID видео
+            uploader = video_data_to_process.get('uploader', video_data_to_process.get('channel', "Unknown Uploader"))
+            logger.info(f"Found YouTube result for '{query}': '{title}' (ID: {video_id}), Uploader: {uploader}, URL: {audio_url[:70]}...")
+            return {
+                "title": title, 
+                "url": audio_url, 
+                "uploader": uploader, 
+                "video_id": video_id
+            }
+        else:
+            logger.warning(f"Could not extract a playable audio URL for '{query}' from processed video data.")
+            return None
+
     except asyncio.TimeoutError: logger.error(f"yt-dlp command timed out for query: {query}"); return None
     except json.JSONDecodeError as e: logger.error(f"Failed to parse JSON from yt-dlp for '{query}': {e}", exc_info=True); return None
-    except FileNotFoundError: logger.error("yt-dlp command not found."); return None
+    except FileNotFoundError: logger.error("yt-dlp command not found. Is it installed and in PATH?"); return None
     except Exception as e: logger.error(f"Unexpected error searching YouTube with yt-dlp for '{query}': {e}", exc_info=True); return None
 
 def _update_current_playing_info(source: str, identifier: str, title: Optional[str] = None,

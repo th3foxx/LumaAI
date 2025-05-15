@@ -156,6 +156,8 @@ class ToolsSettings:
     """Настройки инструментов."""
     weather_api_key: str = os.getenv("WEATHER_API_KEY", "YOUR_WEATHER_API_KEY_HERE")
     weather_api_url: str = os.getenv("WEATHER_API_URL", "https://api.openweathermap.org/data/2.5/weather")
+    jina_search_api_url: str = os.getenv("JINA_SEARCH_API_URL", "https://s.jina.ai/")
+    jina_search_api_key: str = os.getenv("JINA_SEARCH_API_KEY", "YOUR_JINA_SEARCH_API_KEY_HERE")
 
 @dataclass(frozen=True)
 class Settings:

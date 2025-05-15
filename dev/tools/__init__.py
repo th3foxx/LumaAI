@@ -6,6 +6,7 @@ from .device_control import set_device_attribute
 from .memory import manage_mem, search_mem
 from .scheduler import schedule_reminder, list_reminders, cancel_reminder
 from .weather import get_current_weather
+from .web_search import search_web_jina
 from .time import get_current_time
 from .music_control import (
     play_music,
@@ -33,6 +34,7 @@ TOOLS: List = [
     cancel_reminder,
     get_current_time,
     get_current_weather,
+    search_web_jina,
     play_music,
     play_from_youtube,
     pause_music,
@@ -60,6 +62,7 @@ __all__ = [
     "cancel_reminder",
     "get_current_time",
     "get_current_weather",
+    "search_web_jina",
     "play_music",
     "play_from_youtube",
     "pause_music",
