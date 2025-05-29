@@ -53,6 +53,15 @@ class VADSettings:
     min_listening_frames: int = int(os.getenv("VAD_MIN_LISTENING_FRAMES", 30))
     max_listening_frames: int = int(os.getenv("VAD_MAX_LISTENING_FRAMES", 300))
 
+    # Новые параметры для адаптивного VAD и "залипания"
+    dynamic_threshold_enabled: bool = os.getenv("VAD_DYNAMIC_THRESHOLD_ENABLED", "True").lower() in ("true", "1", "t")
+    noise_floor_alpha: float = float(os.getenv("VAD_NOISE_FLOOR_ALPHA", 0.05)) # Коэффициент сглаживания для оценки шума
+    min_dynamic_threshold: float = float(os.getenv("VAD_MIN_DYNAMIC_THRESHOLD", 0.25)) # Мин. значение адаптивного порога
+    max_dynamic_threshold: float = float(os.getenv("VAD_MAX_DYNAMIC_THRESHOLD", 0.75)) # Макс. значение адаптивного порога
+    threshold_margin_factor: float = float(os.getenv("VAD_THRESHOLD_MARGIN_FACTOR", 0.15)) # Насколько порог должен быть выше оцененного шума
+
+    speech_hangover_frames: int = int(os.getenv("VAD_SPEECH_HANGOVER_FRAMES", 8)) # Кол-во кадров "залипания" после окончания речи
+
 
 @dataclass(frozen=True)
 class VoskSettings:

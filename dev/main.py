@@ -347,38 +347,44 @@ class ConnectionManager:
     def __init__(self, wake_word_engine: Optional[WakeWordEngineBase],
                  vad_engine: Optional[VADEngineBase],
                  stt_provider: Optional[STTRecognizerProvider],
-                 tts_engine: Optional[TTSEngineBase], # This will be HybridTTSEngine
+                 tts_engine: Optional[TTSEngineBase],
                  nlu_engine: Optional[NLUEngineBase],
-                 llm_logic_engine: Optional[LLMLogicEngineBase], 
-                 offline_llm_logic_engine: Optional[LLMLogicEngineBase], 
+                 llm_logic_engine: Optional[LLMLogicEngineBase],
+                 offline_llm_logic_engine: Optional[LLMLogicEngineBase],
                  comm_service: Optional[CommunicationServiceBase],
                  offline_processor: Optional[OfflineCommandProcessorBase],
                  global_audio_settings: "AudioSettings", # type: ignore
                  vad_processing_settings: "VADSettings"): # type: ignore
-        
+
         self.wake_word_engine = wake_word_engine
         self.vad_engine = vad_engine
         self.stt_provider = stt_provider
-        self.tts_engine = tts_engine # Injected HybridTTSEngine
+        self.tts_engine = tts_engine
         self.nlu_engine = nlu_engine
         self.llm_logic_engine = llm_logic_engine
-        self.offline_llm_logic_engine = offline_llm_logic_engine 
-        self.comm_service = comm_service 
-        self.offline_processor = offline_processor 
-        self._last_mentioned_device_for_pronoun: Optional[str] = None 
+        self.offline_llm_logic_engine = offline_llm_logic_engine
+        self.comm_service = comm_service
+        self.offline_processor = offline_processor
+        self._last_mentioned_device_for_pronoun: Optional[str] = None
         self.global_audio_settings = global_audio_settings
-        self.vad_processing_settings = vad_processing_settings
+        self.vad_processing_settings = vad_processing_settings # Уже есть
 
         self.websocket: Optional[WebSocket] = None
         self.stt_recognizer: Optional[STTEngineBase.RecognizerInstance] = None
-        self.state: str = "disconnected" 
+        self.state: str = "disconnected"
         self.audio_buffer: bytearray = bytearray()
         self.silence_frames_count: int = 0
         self.frames_in_listening: int = 0
         self.llm_tts_task: Optional[asyncio.Task] = None
         self.is_websocket_active: bool = False
-        
+
         self.local_audio_output_engine: Optional[AudioOutputEngineBase] = None
+
+        # Состояния для адаптивного VAD и "залипания"
+        self.estimated_noise_floor: float = self.vad_processing_settings.probability_threshold # Начальное предположение
+        self.current_dynamic_vad_threshold: float = self.vad_processing_settings.probability_threshold
+        self.potential_silence_frames: int = 0 # Счетчик для "залипания" речи
+        self.was_recently_voiced: bool = False   # Флаг, была ли речь активна недавно
 
         if self.wake_word_engine and self.global_audio_settings.frame_length != self.wake_word_engine.frame_length:
             logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) "
@@ -638,13 +644,13 @@ class ConnectionManager:
             if not is_local_source and self.is_websocket_active : await self.send_error("Server audio engines not ready.")
             return
 
-        bytes_per_sample = 2 
+        bytes_per_sample = 2
         expected_bytes = self.global_audio_settings.frame_length * bytes_per_sample
-        
+
         if len(audio_chunk) != expected_bytes:
             logger.warning(f"Audio chunk size mismatch: got {len(audio_chunk)}, expected {expected_bytes}. Skipping.")
             return
-        
+
         try:
             pcm = struct.unpack_from(f"{self.global_audio_settings.frame_length}h", audio_chunk)
         except struct.error as e:
@@ -659,30 +665,36 @@ class ConnectionManager:
                 self.audio_buffer.clear()
                 self.silence_frames_count = 0
                 self.frames_in_listening = 0
-                if self.stt_recognizer: self.stt_recognizer.reset() # Ensure recognizer exists
-                else: 
+                self.potential_silence_frames = 0 # Сброс для новой сессии слушания
+                self.was_recently_voiced = False    # Сброс для новой сессии слушания
+                # Сброс оценки шума до начального значения или порога по умолчанию при активации
+                self.estimated_noise_floor = self.vad_processing_settings.probability_threshold 
+                self.current_dynamic_vad_threshold = self.vad_processing_settings.probability_threshold
+
+                if self.stt_recognizer: self.stt_recognizer.reset()
+                else:
                     logger.error("STT recognizer not available after wake word detection!")
                     if not is_local_source and self.is_websocket_active: await self.send_error("Server STT error.")
-                    self.state = "wakeword" # Revert state
+                    self.state = "wakeword"
                     return
 
                 if self.is_websocket_active:
                     await self.send_status("listening_started", "Listening...")
-                else: 
+                else:
                      logger.info("Local: Listening started...")
                      if self.local_audio_output_engine and not self.local_audio_output_engine.is_running:
                          self.local_audio_output_engine.start()
 
 
         elif self.state == "listening":
-            if not self.stt_recognizer: # Should not happen if checked above, but defensive
+            if not self.stt_recognizer:
                 logger.error("STT recognizer not available in listening state!")
                 if not is_local_source and self.is_websocket_active: await self.send_error("Server STT error.")
                 self.state = "wakeword"
                 return
 
             self.frames_in_listening += 1
-            self.audio_buffer.extend(audio_chunk) 
+            self.audio_buffer.extend(audio_chunk)
 
             self.stt_recognizer.accept_waveform(audio_chunk)
             partial_result_json = self.stt_recognizer.partial_result()
@@ -691,25 +703,60 @@ class ConnectionManager:
                 await self.send_transcript(partial_transcript, is_final=False)
 
             voice_probability = self.vad_engine.process(pcm)
-            is_voiced = voice_probability > self.vad_processing_settings.probability_threshold
+            active_threshold: float
 
-            if not is_voiced:
-                self.silence_frames_count += 1
+            if self.vad_processing_settings.dynamic_threshold_enabled:
+                # Обновляем оценку уровня шума, если вероятность голоса низкая
+                # (предполагаем, что это шум)
+                if voice_probability < self.current_dynamic_vad_threshold * 0.7: # Эвристика
+                    self.estimated_noise_floor = (1 - self.vad_processing_settings.noise_floor_alpha) * self.estimated_noise_floor + \
+                                                 self.vad_processing_settings.noise_floor_alpha * voice_probability
+                    self.estimated_noise_floor = max(0.0, min(self.estimated_noise_floor, 1.0)) # Ограничиваем 0-1
+
+                # Рассчитываем динамический порог: немного выше оцененного шума
+                self.current_dynamic_vad_threshold = self.estimated_noise_floor + self.vad_processing_settings.threshold_margin_factor
+                self.current_dynamic_vad_threshold = max(self.vad_processing_settings.min_dynamic_threshold,
+                                                         min(self.current_dynamic_vad_threshold, self.vad_processing_settings.max_dynamic_threshold))
+                active_threshold = self.current_dynamic_vad_threshold
+                # if self.frames_in_listening % 10 == 0: # Логирование для отладки
+                #     logger.debug(f"VAD Prob: {voice_probability:.3f}, NoiseEst: {self.estimated_noise_floor:.3f}, DynThr: {active_threshold:.3f}")
             else:
-                self.silence_frames_count = 0
+                active_threshold = self.vad_processing_settings.probability_threshold
+
+            is_voiced = voice_probability > active_threshold
+
+            if is_voiced:
+                self.silence_frames_count = 0 # Сбрасываем счетчик тишины, так как есть голос
+                self.potential_silence_frames = 0 # Сбрасываем счетчик "потенциальной тишины"
+                self.was_recently_voiced = True     # Отмечаем, что голос был активен
+            else: # Голоса нет (is_voiced == False)
+                if self.was_recently_voiced:
+                    # Голос только что был, возможно, это короткая пауза ("залипание")
+                    self.potential_silence_frames += 1
+                    if self.potential_silence_frames > self.vad_processing_settings.speech_hangover_frames:
+                        # Период "залипания" прошел, теперь это настоящая тишина
+                        # Начинаем считать кадры реальной тишины с этого момента
+                        self.silence_frames_count = self.potential_silence_frames - self.vad_processing_settings.speech_hangover_frames
+                        # self.was_recently_voiced = False # Можно сбросить, но если голос снова появится, он снова станет True.
+                                                        # Оставим True, чтобы следующая тишина тоже прошла через hangover.
+                    # else: все еще в периоде "залипания", silence_frames_count остается 0
+                else:
+                    # Голоса не было недавно И сейчас тоже нет (продолжительная тишина после "залипания" или с самого начала)
+                    self.silence_frames_count += 1
 
             grace_over = self.frames_in_listening >= self.vad_processing_settings.min_listening_frames
+            # Используем self.silence_frames_count, который учитывает "залипание"
             silence_met = self.silence_frames_count >= self.vad_processing_settings.silence_frames_threshold
             max_len_met = self.frames_in_listening >= self.vad_processing_settings.max_listening_frames
 
             trigger_finalization = False
             if max_len_met:
-                logger.info("Max listening frames reached, finalizing.")
+                logger.info(f"Max listening frames ({self.frames_in_listening}) reached, finalizing.")
                 trigger_finalization = True
             elif grace_over and silence_met:
-                logger.info("VAD detected end of speech.")
+                logger.info(f"VAD detected end of speech (silence frames: {self.silence_frames_count} >= {self.vad_processing_settings.silence_frames_threshold}).")
                 trigger_finalization = True
-            
+
             if trigger_finalization:
                 final_result_json = self.stt_recognizer.final_result()
                 final_transcript = json.loads(final_result_json).get("text", "").strip()
@@ -720,20 +767,22 @@ class ConnectionManager:
 
                 if final_transcript:
                     if self.llm_tts_task and not self.llm_tts_task.done():
-                        self.llm_tts_task.cancel() 
+                        self.llm_tts_task.cancel()
                     self.llm_tts_task = asyncio.create_task(
                         self._run_llm_tts_or_offline(final_transcript, thread_id)
                     )
-                else: 
+                else:
                     self.state = "wakeword"
                     if self.is_websocket_active:
                         await self.send_status("wakeword_listening", "No speech detected. Waiting for wake word...")
                     else:
                         logger.info("Local: No speech detected. Waiting for wake word...")
-                
+
                 self.audio_buffer.clear()
                 self.silence_frames_count = 0
                 self.frames_in_listening = 0
+                self.potential_silence_frames = 0 # Сброс состояния "залипания"
+                self.was_recently_voiced = False    # Сброс состояния "залипания"
 
 
 @app.websocket("/ws")
