@@ -23,7 +23,10 @@ class EngineSelectorSettings:
     wake_word_engine: str = os.getenv("WAKE_WORD_ENGINE", "picovoice_porcupine")
     vad_engine: str = os.getenv("VAD_ENGINE", "picovoice_cobra")
     stt_engine: str = os.getenv("STT_ENGINE", "vosk") # e.g., "vosk"
-    tts_engine: str = os.getenv("TTS_ENGINE", "paroli") # e.g., "paroli"
+    tts_engine: str = os.getenv("TTS_ENGINE", "hybrid") # Default to hybrid
+    # Names of specific implementations for online/offline roles if tts_engine is "hybrid"
+    tts_online_provider: str = os.getenv("TTS_ONLINE_PROVIDER", "gemini") # e.g., "gemini"
+    tts_offline_provider: str = os.getenv("TTS_OFFLINE_PROVIDER", "paroli") # e.g., "paroli"
     nlu_engine: str = os.getenv("NLU_ENGINE", "rasa")   # e.g., "rasa"
     llm_logic_engine: str = os.getenv("LLM_LOGIC_ENGINE", "langgraph") # e.g., "langgraph"
     offline_llm_engine: str = os.getenv("OFFLINE_LLM_ENGINE", "ollama") # e.g., "ollama" for offline
@@ -81,6 +84,16 @@ class ParoliServerSettings:
     length_scale: Optional[float] = float(os.getenv("PAROLI_LENGTH_SCALE")) if os.getenv("PAROLI_LENGTH_SCALE") else None
     noise_scale: Optional[float] = float(os.getenv("PAROLI_NOISE_SCALE")) if os.getenv("PAROLI_NOISE_SCALE") else None
     noise_w: Optional[float] = float(os.getenv("PAROLI_NOISE_W")) if os.getenv("PAROLI_NOISE_W") else None
+
+
+@dataclass(frozen=True)
+class GeminiTTSSettings:
+    """Настройки Gemini Speech TTS."""
+    api_key: Optional[str] = os.getenv("GEMINI_API_KEY")
+    # Model name for TTS. Example from prompt: "gemini-2.5-flash-preview-tts"
+    model: str = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts") # Defaulting to a common pattern, user should verify/set
+    voice_name: str = os.getenv("GEMINI_TTS_VOICE", "Kore") # Default from user prompt
+    sample_rate: int = 24000 # Gemini TTS output is 24kHz
 
 
 @dataclass(frozen=True)
@@ -235,6 +248,7 @@ class Settings:
     vad_config: VADSettings = field(default_factory=VADSettings) # General VAD config
     vosk: VoskSettings = field(default_factory=VoskSettings)
     paroli_server: ParoliServerSettings = field(default_factory=ParoliServerSettings)
+    gemini_tts: GeminiTTSSettings = field(default_factory=GeminiTTSSettings) # Added Gemini TTS settings
     audio: AudioSettings = field(default_factory=AudioSettings)
     webapp: WebAppSettings = field(default_factory=WebAppSettings)
     postgres: PostgresSettings = field(default_factory=PostgresSettings)

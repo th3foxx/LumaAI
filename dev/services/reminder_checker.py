@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 # Imports from your project
-from settings import settings
+from settings import settings # Предполагаем, что здесь может быть default_tts_sample_rate
 from tools.scheduler import get_due_reminders_and_mark_triggered, DB_PATH # DB_PATH for logging
 from utils.notifications import send_telegram_message
 
@@ -13,6 +13,9 @@ from utils.notifications import send_telegram_message
 # A better approach in a larger app would be dependency injection.
 # from main import tts_engine, audio_output_engine # This creates a circular dependency if not careful
 # Let's assume these are passed to the start_reminder_checker function
+
+# Допустим, в settings есть такой параметр для fallback
+# settings.default_tts_sample_rate = 22050 # или другой разумный дефолт
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +50,37 @@ async def check_and_process_reminders_periodically(tts_engine_ref, audio_output_
                             audio_output_engine_ref.start()
                         
                         if audio_output_engine_ref.is_running: # Double check
+                            
+                            # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+                            actual_sample_rate = settings.sounddevice.tts_output_sample_rate # Используем из настроек sounddevice как fallback
+                            active_tts_sub_engine = None
+                            if hasattr(tts_engine_ref, 'get_active_engine_for_synthesis'): # Проверяем, что это HybridTTS
+                                active_tts_sub_engine = await tts_engine_ref.get_active_engine_for_synthesis()
+                            
+                            if active_tts_sub_engine:
+                                try:
+                                    actual_sample_rate = active_tts_sub_engine.get_output_sample_rate()
+                                    logger.info(f"Using sample rate {actual_sample_rate}Hz from active TTS sub-engine for reminder ID {reminder_id}.")
+                                except Exception as e_sr:
+                                    logger.warning(f"Could not get sample rate from active TTS sub-engine for reminder ID {reminder_id}: {e_sr}. Falling back to {actual_sample_rate}Hz.")
+                            elif hasattr(tts_engine_ref, 'get_output_sample_rate'): # Если это не гибридный, но имеет метод
+                                try:
+                                    actual_sample_rate = tts_engine_ref.get_output_sample_rate()
+                                    logger.info(f"Using sample rate {actual_sample_rate}Hz from TTS engine for reminder ID {reminder_id}.")
+                                except Exception as e_sr:
+                                     logger.warning(f"Could not get sample rate from TTS engine for reminder ID {reminder_id}: {e_sr}. Falling back to {actual_sample_rate}Hz.")
+                            else:
+                                logger.warning(f"TTS engine type does not support dynamic sample rate retrieval for reminder ID {reminder_id}. Using default sample rate {actual_sample_rate}Hz.")
+                            # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+
                             tts_audio_bytes = bytearray()
                             async for chunk in tts_engine_ref.synthesize_stream(full_announcement):
                                 tts_audio_bytes.extend(chunk)
                             
                             if tts_audio_bytes:
-                                logger.info(f"Playing voice announcement for reminder ID {reminder_id} ({len(tts_audio_bytes)} bytes).")
-                                audio_output_engine_ref.play_tts_bytes(bytes(tts_audio_bytes))
+                                logger.info(f"Playing voice announcement for reminder ID {reminder_id} ({len(tts_audio_bytes)} bytes) at {actual_sample_rate}Hz.")
+                                # --- ИЗМЕНЕНИЕ: передаем actual_sample_rate ---
+                                audio_output_engine_ref.play_tts_bytes(bytes(tts_audio_bytes), sample_rate=actual_sample_rate)
                             else:
                                 logger.warning(f"TTS produced no audio for reminder ID {reminder_id}.")
                         else:

@@ -128,10 +128,7 @@ class ParoliTTSEngine(TTSEngineBase):
             logger.warning("Paroli server process not running, TTS unhealthy.")
             return False
         try:
-            # Simple health check: try to connect to the WebSocket
             async with websockets.connect(self.settings.ws_url, open_timeout=1.0, close_timeout=1.0) as ws:
-                # Optionally send a ping or a very simple request if supported
-                # await ws.ping() 
                 logger.debug("Paroli TTS health check: WebSocket connection successful.")
                 return True
         except Exception as e:
@@ -142,7 +139,6 @@ class ParoliTTSEngine(TTSEngineBase):
     async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
         if not await self.is_healthy():
              logger.error("Paroli Server not healthy or not configured. Cannot synthesize TTS.")
-             # yield b"" # Or raise an error
              return
 
         tts_success = False
@@ -188,7 +184,7 @@ class ParoliTTSEngine(TTSEngineBase):
                                 logger.error(f"Paroli Server TTS failed: {error_msg}")
                         except json.JSONDecodeError:
                             logger.error(f"Could not decode final status JSON from Paroli: {message}")
-                        break # End receiving loop
+                        break 
                     else:
                         logger.warning(f"Unexpected message type from Paroli: {type(message)}")
             
@@ -204,11 +200,6 @@ class ParoliTTSEngine(TTSEngineBase):
         except Exception as e:
             logger.error(f"Paroli Server TTS streaming error: {e}", exc_info=True)
         finally:
-            # Ensure the async generator is properly closed if an error occurred mid-stream
-            # This is implicitly handled by exiting the async for loop in the caller
-            # or by the generator context being destroyed.
-            # If we needed to send a sentinel, we'd do it here, but for Paroli,
-            # the JSON status message or connection close signals the end.
             pass
 
 
@@ -217,3 +208,18 @@ class ParoliTTSEngine(TTSEngineBase):
         async for chunk in self.synthesize_stream(text):
             all_audio.extend(chunk)
         return bytes(all_audio)
+
+    def get_output_sample_rate(self) -> int:
+        if self.settings.audio_format == "pcm":
+            return self.settings.pcm_sample_rate
+        else:
+            # For other formats (e.g., opus), the sample rate might be fixed or encoded within the stream.
+            # This method should return the *decoded* PCM sample rate if Paroli were to output PCM.
+            # If Paroli server itself has a fixed output rate for all formats before encoding, use that.
+            # For now, we assume pcm_sample_rate is the target rate.
+            logger.warning(
+                f"ParoliTTSEngine: Output format is '{self.settings.audio_format}'. "
+                f"Returning configured pcm_sample_rate ({self.settings.pcm_sample_rate}) as the output sample rate. "
+                "This may not be accurate if the actual output stream has a different inherent sample rate."
+            )
+            return self.settings.pcm_sample_rate if self.settings.pcm_sample_rate else 22050 # Fallback

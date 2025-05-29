@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Dict, Any
+from typing import AsyncIterator, Dict, Any, Optional # Added Optional
 
 class TTSEngineBase(ABC):
     @abstractmethod
@@ -38,4 +38,14 @@ class TTSEngineBase(ABC):
     @abstractmethod
     async def is_healthy(self) -> bool:
         """Checks if the TTS engine/server is operational."""
+        pass
+
+    @abstractmethod
+    def get_output_sample_rate(self) -> int:
+        """
+        Returns the native output sample rate of this TTS engine in Hz.
+        For hybrid engines, this might be a preferred or default rate.
+        It's recommended to get the active sub-engine and query its sample rate directly
+        for more accuracy when using a hybrid engine.
+        """
         pass

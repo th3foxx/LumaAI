@@ -37,9 +37,11 @@ from engines.wake_word.picovoice_porcupine import PicovoicePorcupineEngine
 from engines.vad.picovoice_cobra import PicovoiceCobraEngine
 from engines.stt.vosk_stt import VoskSTTEngine
 from engines.tts.paroli_tts import ParoliTTSEngine
+from engines.tts.gemini_tts import GeminiTTSEngine # NEW
+from engines.tts.hybrid_tts import HybridTTSEngine # NEW
 from engines.nlu.rasa_nlu import RasaNLUEngine
 from engines.llm_logic.langgraph_llm import LangGraphLLMEngine
-from engines.llm_logic.ollama_llm import OllamaLLMEngine # NEW
+from engines.llm_logic.ollama_llm import OllamaLLMEngine 
 from engines.audio_io.sounddevice_io import SoundDeviceInputEngine, SoundDeviceOutputEngine
 from engines.communication.mqtt_service import MQTTService
 from engines.offline_processing.base import OfflineCommandProcessorBase
@@ -58,7 +60,7 @@ logger = logging.getLogger(__name__)
 wake_word_engine: Optional[WakeWordEngineBase] = None
 vad_engine: Optional[VADEngineBase] = None
 stt_engine: Optional[STTRecognizerProvider] = None # Provides recognizer instances
-tts_engine: Optional[TTSEngineBase] = None
+tts_engine: Optional[TTSEngineBase] = None # This will be the HybridTTSEngine
 nlu_engine: Optional[NLUEngineBase] = None
 llm_logic_engine: Optional[LLMLogicEngineBase] = None
 offline_llm_logic_engine: Optional[LLMLogicEngineBase] = None # For offline logic (e.g., Ollama)
@@ -74,7 +76,7 @@ manager: Optional[ConnectionManager] = None # Global instance, initialized in li
 
 ASSISTANT_THREAD_ID = "lumi-voice-assistant-session" # For LLM context
 
-def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings):
+def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings) -> Optional[Any]: # Return type Any for flexibility
     logger.info(f"Creating engine: {engine_name} of type {engine_type}")
     try:
         if engine_type == "wake_word":
@@ -95,18 +97,44 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
         elif engine_type == "tts":
             if engine_name == "paroli":
                 return ParoliTTSEngine(config=global_settings.paroli_server)
+            elif engine_name == "gemini":
+                # GeminiTTSEngine expects GeminiTTSSettings instance
+                if not global_settings.gemini_tts.api_key: # Check API key early
+                     logger.warning("Gemini TTS engine selected, but API key is missing in settings. It will likely fail.")
+                return GeminiTTSEngine(config=global_settings.gemini_tts)
+            elif engine_name == "hybrid":
+                online_provider_name = global_settings.engines.tts_online_provider
+                offline_provider_name = global_settings.engines.tts_offline_provider
+
+                logger.info(f"Creating Hybrid TTS: Online provider='{online_provider_name}', Offline provider='{offline_provider_name}'")
+
+                # Recursively create provider instances
+                online_tts_instance = create_engine_instance("tts", online_provider_name, global_settings)
+                offline_tts_instance = create_engine_instance("tts", offline_provider_name, global_settings)
+
+                if not online_tts_instance:
+                    logger.warning(f"Hybrid TTS: Online provider '{online_provider_name}' failed to initialize.")
+                if not offline_tts_instance:
+                    logger.warning(f"Hybrid TTS: Offline provider '{offline_provider_name}' failed to initialize.")
+                
+                if not online_tts_instance and not offline_tts_instance:
+                    logger.error("Hybrid TTS: Both online and offline providers failed to initialize. Hybrid TTS will not be functional.")
+                    return None # Critical failure for hybrid if no providers
+
+                return HybridTTSEngine(config={
+                    "online_engine": online_tts_instance,
+                    "offline_engine": offline_tts_instance
+                })
         elif engine_type == "nlu":
             if engine_name == "rasa":
-                # RasaNLUEngine needs settings.rasa_nlu
                 return RasaNLUEngine(config=global_settings.rasa_nlu)
         elif engine_type == "llm_logic":
             if engine_name == "langgraph":
-                # LangGraphLLMEngine needs settings.ai and settings.postgres
                 return LangGraphLLMEngine(config={
                     "ai_settings": global_settings.ai,
                     "postgres_settings": global_settings.postgres
                 })
-        elif engine_type == "offline_llm_logic": # This is for the offline LLM
+        elif engine_type == "offline_llm_logic": 
              if engine_name == "ollama":
                 if global_settings.ollama.base_url and global_settings.ollama.model:
                     return OllamaLLMEngine(config={"ollama_settings": global_settings.ollama})
@@ -115,14 +143,12 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
                     return None
         elif engine_type == "audio_input":
             if engine_name == "sounddevice":
-                # Needs callback, loop, and specific configs
-                # Callback will be set after ConnectionManager is initialized
                 return SoundDeviceInputEngine(
-                    process_audio_callback=None, # Will be set later
-                    loop=asyncio.get_running_loop(), # Assuming this is called within an async context
+                    process_audio_callback=None, 
+                    loop=asyncio.get_running_loop(), 
                     config={
                         "sounddevice_settings": global_settings.sounddevice,
-                        "audio_settings": global_settings.audio # Global audio settings
+                        "audio_settings": global_settings.audio 
                     }
                 )
         elif engine_type == "audio_output":
@@ -142,25 +168,20 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
 
 async def initialize_global_engines(app_settings: Settings):
     global wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine
-    global llm_logic_engine, offline_llm_logic_engine # Added offline_llm_logic_engine
+    global llm_logic_engine, offline_llm_logic_engine 
     global audio_input_engine, audio_output_engine, comm_service, manager
     global offline_command_processor
 
     logger.info("Initializing global engines...")
 
-    # Communication Service (e.g., MQTT) - needed by some tools/NLU potentially
     comm_service = create_engine_instance("communication", app_settings.engines.communication_engine, app_settings)
     if comm_service:
         await comm_service.startup()
-        # **Inject comm_service into tools module immediately after it's ready**
-        from tools.device_control import initialize_device_control_tool # Ensure this import is here
+        from tools.device_control import initialize_device_control_tool 
         initialize_device_control_tool(comm_service)
-        # You might need to do this for other tools if they also need comm_service
     else:
-        logger.error("Communication service failed to initialize. Dependent services (offline processor, device tools) will be affected.")
-        # No point in initializing tools that depend on a non-existent comm_service
+        logger.error("Communication service failed to initialize. Dependent services will be affected.")
 
-    # 2. Initialize Offline Command Processor (needs comm_service)
     if comm_service:
         offline_command_processor = DefaultOfflineCommandProcessor(comm_service=comm_service)
         logger.info("DefaultOfflineCommandProcessor initialized.")
@@ -168,22 +189,21 @@ async def initialize_global_engines(app_settings: Settings):
         offline_command_processor = None
         logger.warning("OfflineCommandProcessor not initialized as comm_service is unavailable.")
 
-    # Core processing engines
     wake_word_engine = create_engine_instance("wake_word", app_settings.engines.wake_word_engine, app_settings)
     vad_engine = create_engine_instance("vad", app_settings.engines.vad_engine, app_settings)
     stt_engine = create_engine_instance("stt", app_settings.engines.stt_engine, app_settings)
+    
+    # TTS Engine (potentially Hybrid)
     tts_engine = create_engine_instance("tts", app_settings.engines.tts_engine, app_settings)
+    
     nlu_engine = create_engine_instance("nlu", app_settings.engines.nlu_engine, app_settings)
-    # Online LLM
     llm_logic_engine = create_engine_instance("llm_logic", app_settings.engines.llm_logic_engine, app_settings)
-    # Offline LLM
     offline_llm_logic_engine = create_engine_instance("offline_llm_logic", app_settings.engines.offline_llm_engine, app_settings)
-
-    # Initialize ConnectionManager (needed for audio_input_engine callback)
-    # Pass already initialized engines to ConnectionManager
-    # Check primary engines; offline LLM is optional.
+    
     if not all([wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine, comm_service]): 
         logger.critical("One or more core processing or communication engines failed to initialize. Functionality will be severely limited.")
+    if not tts_engine: # Specifically check tts_engine after its creation attempt
+        logger.critical("TTS Engine (potentially Hybrid) failed to initialize. TTS functionality will be unavailable.")
     if not llm_logic_engine:
         logger.warning("Online LLM logic engine failed to initialize. Online general queries will not work.")
     if not offline_llm_logic_engine:
@@ -195,10 +215,10 @@ async def initialize_global_engines(app_settings: Settings):
         wake_word_engine=wake_word_engine,
         vad_engine=vad_engine,
         stt_provider=stt_engine, 
-        tts_engine=tts_engine,
+        tts_engine=tts_engine, # This is now the Hybrid Engine
         nlu_engine=nlu_engine,
-        llm_logic_engine=llm_logic_engine, # Online LLM
-        offline_llm_logic_engine=offline_llm_logic_engine, # Offline LLM
+        llm_logic_engine=llm_logic_engine, 
+        offline_llm_logic_engine=offline_llm_logic_engine, 
         comm_service=comm_service,
         offline_processor=offline_command_processor,
         global_audio_settings=app_settings.audio,
@@ -206,19 +226,15 @@ async def initialize_global_engines(app_settings: Settings):
     )
     logger.info("ConnectionManager initialized.")
 
-    # Audio I/O engines (Local mic/speaker)
-    # Audio Input
     _audio_input_engine_instance = create_engine_instance("audio_input", app_settings.engines.audio_input_engine, app_settings)
     if _audio_input_engine_instance and isinstance(_audio_input_engine_instance, AudioInputEngineBase):
-        # Dynamically set the callback now that 'manager' exists
         async def process_audio_wrapper(audio_chunk: bytes):
-            if manager: # Ensure manager is fully initialized
+            if manager: 
                 await manager.process_audio(audio_chunk, ASSISTANT_THREAD_ID, is_local_source=True)
-        _audio_input_engine_instance._process_audio_cb = process_audio_wrapper # Assuming direct access for simplicity
+        _audio_input_engine_instance._process_audio_cb = process_audio_wrapper 
         audio_input_engine = _audio_input_engine_instance
         logger.info(f"AudioInputEngine ({app_settings.engines.audio_input_engine}) created.")
         if audio_input_engine and audio_input_engine.is_enabled:
-             # Check compatibility with wake word engine
             if wake_word_engine and audio_input_engine.sample_rate != wake_word_engine.sample_rate:
                  logger.warning(f"AudioInput sample rate ({audio_input_engine.sample_rate}) "
                                 f"differs from WakeWord sample rate ({wake_word_engine.sample_rate}).")
@@ -230,32 +246,38 @@ async def initialize_global_engines(app_settings: Settings):
     else:
         logger.warning(f"Could not create or wrong type for AudioInputEngine: {app_settings.engines.audio_input_engine}")
 
-
-    # Audio Output (needs to be available for ConnectionManager)
     audio_output_engine = create_engine_instance("audio_output", app_settings.engines.audio_output_engine, app_settings)
     if audio_output_engine and audio_output_engine.is_enabled:
         logger.info(f"AudioOutputEngine ({app_settings.engines.audio_output_engine}) created and enabled.")
-        # Pass to manager if it needs to directly control local playback (alternative to event bus)
         if manager: manager.set_local_audio_output(audio_output_engine)
     else:
         logger.info(f"AudioOutputEngine ({app_settings.engines.audio_output_engine}) is disabled or failed to initialize.")
 
-
     # Startup for engines that need it (TTS server, LLM DB connections, MQTT)
     # comm_service already started up
-    if tts_engine: await tts_engine.startup()
+    if tts_engine: await tts_engine.startup() # This will call startup on Hybrid, then on Gemini and Paroli
     if llm_logic_engine: await llm_logic_engine.startup()
-    # Audio I/O engines are typically started/stopped based on WebSocket connection or app state
+    if offline_llm_logic_engine: await offline_llm_logic_engine.startup() # Ensure offline LLM also starts up if configured
 
     logger.info("Global engines initialization phase complete.")
 
 
 async def shutdown_global_engines():
     logger.info("Shutting down global engines...")
+    # Order might matter for dependencies, shutdown in reverse order of startup is a good heuristic
     engine_list = [
-        tts_engine, llm_logic_engine, offline_llm_logic_engine, comm_service, nlu_engine,
+        # Higher level / composite engines first
+        tts_engine, # Hybrid engine, will call shutdown on its components
+        # LLMs
+        llm_logic_engine, offline_llm_logic_engine,
+        # NLU
+        nlu_engine,
+        # Audio processing pipeline components
         wake_word_engine, vad_engine, stt_engine, 
-        audio_input_engine, audio_output_engine 
+        # IO Engines
+        audio_input_engine, audio_output_engine,
+        # Communication
+        comm_service 
     ]
     for engine in engine_list:
         if engine and hasattr(engine, "shutdown"):
@@ -272,43 +294,35 @@ async def shutdown_global_engines():
 async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase beginning...")
 
-    # Initialize scheduler database
     try:
-        init_scheduler_db() # Call the DB init function from tools.scheduler
-        init_music_likes_table() # <--- Для music_data.db (таблица liked_songs)
+        init_scheduler_db() 
+        init_music_likes_table() 
     except Exception as e:
-        logger.error(f"Failed to initialize scheduler database: {e}. Reminders will not work.", exc_info=True)
-        # Decide if this is a fatal error for your application
+        logger.error(f"Failed to initialize scheduler or music database: {e}. Some features might not work.", exc_info=True)
 
-    await initialize_global_engines(settings) # Pass the global settings object
+    await initialize_global_engines(settings) 
 
-    # Start the reminder checker background task
-    # It needs references to tts_engine and audio_output_engine
-    global tts_engine, audio_output_engine # Ensure these are accessible
-    if tts_engine and audio_output_engine:
-         # Check if scheduler_db_path is set, otherwise reminder checker might not work well
+    global tts_engine, audio_output_engine 
+    if tts_engine and audio_output_engine and await tts_engine.is_healthy() and audio_output_engine.is_enabled: # Check tts_engine health
         if not settings.scheduler_db_path:
             logger.warning("Scheduler DB path not set. Reminder checker might not function correctly.")
-        await start_reminder_checker(tts_engine, audio_output_engine)
+        await start_reminder_checker(tts_engine, audio_output_engine) # tts_engine is Hybrid
     else:
-        logger.warning("TTS or Audio Output engine not available, reminder checker not started.")
+        logger.warning("TTS or Audio Output engine not available/healthy, reminder checker not started.")
 
-    # Start local audio if enabled and no WebSocket is immediately active
-    # This logic is now partly in ConnectionManager's connect/disconnect
-    # and initial startup here.
     if audio_input_engine and audio_input_engine.is_enabled and \
        audio_output_engine and audio_output_engine.is_enabled and \
        manager and not manager.is_websocket_active:
         logger.info("Lifespan: No active WebSocket, starting local audio I/O.")
-        audio_output_engine.start() # Start output capability
-        audio_input_engine.start()  # Start microphone
-        manager.state = "wakeword" # Set initial state for local audio
+        audio_output_engine.start() 
+        audio_input_engine.start()  
+        manager.state = "wakeword" 
         logger.info("Lifespan: Local audio interface activated, waiting for wake word.")
     
     logger.info("Lifespan: Startup phase complete.")
     yield
     logger.info("Lifespan: Shutdown phase beginning...")
-    await stop_reminder_checker() # Stop the reminder checker first
+    await stop_reminder_checker() 
     await shutdown_global_engines()
     logger.info("Lifespan: Shutdown phase complete.")
 
@@ -333,10 +347,10 @@ class ConnectionManager:
     def __init__(self, wake_word_engine: Optional[WakeWordEngineBase],
                  vad_engine: Optional[VADEngineBase],
                  stt_provider: Optional[STTRecognizerProvider],
-                 tts_engine: Optional[TTSEngineBase],
+                 tts_engine: Optional[TTSEngineBase], # This will be HybridTTSEngine
                  nlu_engine: Optional[NLUEngineBase],
-                 llm_logic_engine: Optional[LLMLogicEngineBase], # Online
-                 offline_llm_logic_engine: Optional[LLMLogicEngineBase], # Offline
+                 llm_logic_engine: Optional[LLMLogicEngineBase], 
+                 offline_llm_logic_engine: Optional[LLMLogicEngineBase], 
                  comm_service: Optional[CommunicationServiceBase],
                  offline_processor: Optional[OfflineCommandProcessorBase],
                  global_audio_settings: "AudioSettings", # type: ignore
@@ -345,10 +359,10 @@ class ConnectionManager:
         self.wake_word_engine = wake_word_engine
         self.vad_engine = vad_engine
         self.stt_provider = stt_provider
-        self.tts_engine = tts_engine
+        self.tts_engine = tts_engine # Injected HybridTTSEngine
         self.nlu_engine = nlu_engine
         self.llm_logic_engine = llm_logic_engine
-        self.offline_llm_logic_engine = offline_llm_logic_engine # Store it
+        self.offline_llm_logic_engine = offline_llm_logic_engine 
         self.comm_service = comm_service 
         self.offline_processor = offline_processor 
         self._last_mentioned_device_for_pronoun: Optional[str] = None 
@@ -425,6 +439,16 @@ class ConnectionManager:
             await self.send_error("Server STT engine failure.")
             await self.disconnect(code=1011)
             return False
+        
+        # Check TTS engine health on connect as well
+        if not self.tts_engine or not await self.tts_engine.is_healthy():
+            logger.error("TTS engine not available or not healthy!")
+            await self.send_error("Server TTS error.")
+            # Don't necessarily disconnect, but log critical error.
+            # Client might still be able to send audio for STT.
+            # await self.disconnect(code=1011, reason="Server TTS unavailable")
+            # return False
+
 
         logger.info("Client connected via WebSocket.")
         await self.send_status("wakeword_listening", "Waiting for wake word...")
@@ -450,7 +474,7 @@ class ConnectionManager:
         
         self.state = "disconnected" 
 
-        logger.info("WebSocket client disconnected.")
+        logger.info(f"WebSocket client disconnected. Code: {code}, Reason: {reason}")
 
         if audio_input_engine and audio_input_engine.is_enabled:
             logger.info("WebSocket disconnected, resuming local audio input.")
@@ -492,102 +516,118 @@ class ConnectionManager:
             await self._send_json({"type": "error", "message": error_message})
     
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
-        response_text = ""
-        tts_audio_bytes_for_local = bytearray()
-        
-        try:
-            if self.is_websocket_active:
-                await self.send_status("processing_started", "Thinking...")
-            else:
-                 logger.info("Processing request (local audio)...")
-            self.state = "processing"
+            response_text = ""
+            tts_audio_bytes_for_local = bytearray()
+            current_tts_sample_rate_for_local_playback = None # Store the SR for local playback
+            
+            try:
+                if self.is_websocket_active:
+                    await self.send_status("processing_started", "Thinking...")
+                else:
+                    logger.info("Processing request (local audio)...")
+                self.state = "processing"
 
-            online = await is_internet_available()
-            # Determine if online processing should be attempted
-            attempt_online_processing = online and settings.ai.online_mode and self.llm_logic_engine
+                online_capable = await is_internet_available()
+                attempt_online_processing = online_capable and settings.ai.online_mode and self.llm_logic_engine
 
-            if attempt_online_processing:
-                logger.info("Using online LLM (LangGraph).")
-                lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
-                response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
-                if not response_text: response_text = "Sorry, I didn't get a response from the online assistant."
+                if attempt_online_processing:
+                    logger.info("Using online LLM (LangGraph).")
+                    lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
+                    response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                    if not response_text: response_text = "Sorry, I didn't get a response from the online assistant."
 
-            else: # Offline processing path
-                logger.info("Offline processing path activated.")
-                nlu_result = None
-                if self.nlu_engine:
-                    logger.debug("Attempting NLU parse for potential offline command.")
-                    nlu_result = await self.nlu_engine.parse(text)
+                else: 
+                    logger.info(f"Offline processing path activated (Internet: {online_capable}, Online Mode: {settings.ai.online_mode}).")
+                    nlu_result = None
+                    if self.nlu_engine:
+                        logger.debug("Attempting NLU parse for potential offline command.")
+                        nlu_result = await self.nlu_engine.parse(text)
 
-                if nlu_result and nlu_result.get("intent"): # NLU found a command
-                    if self.offline_processor:
-                        logger.info(f"Offline NLU parsed command: {nlu_result}")
-                        resolved_command = await self.offline_processor.process_nlu_result(
-                            nlu_result, self._last_mentioned_device_for_pronoun
-                        )
-                        response_text = await self.offline_processor.execute_resolved_command(resolved_command)
+                    if nlu_result and nlu_result.get("intent"): 
+                        if self.offline_processor:
+                            logger.info(f"Offline NLU parsed command: {nlu_result}")
+                            resolved_command = await self.offline_processor.process_nlu_result(
+                                nlu_result, self._last_mentioned_device_for_pronoun
+                            )
+                            response_text = await self.offline_processor.execute_resolved_command(resolved_command)
+                            
+                            if resolved_command.get("executable") and \
+                            resolved_command.get("resolved_device_name_for_context_update"):
+                                self._last_mentioned_device_for_pronoun = resolved_command["resolved_device_name_for_context_update"]
+                                logger.debug(f"ConnectionManager: Updated pronoun context to '{self._last_mentioned_device_for_pronoun}'")
+                        else: 
+                            logger.warning("Offline NLU parsed a command, but no offline_processor is available.")
+                            response_text = "I understood an offline command, but cannot process it right now."
+                    else: 
+                        if self.offline_llm_logic_engine:
+                            logger.info("NLU did not identify a command / NLU unavailable. Trying offline LLM (Ollama).")
+                            lumi_response = await self.offline_llm_logic_engine.ask(text, thread_id=thread_id)
+                            response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                            if not response_text: response_text = "The offline assistant didn't provide a response."
+                        else: 
+                            logger.info("NLU did not identify a command, and offline LLM is not available.")
+                            response_text = "I can only process specific commands offline, and this wasn't one of them. The general offline assistant is also unavailable."
+                
+                # TTS Synthesis
+                if response_text and self.tts_engine: # self.tts_engine is Hybrid
+                    active_tts_synthesizer = None
+                    if isinstance(self.tts_engine, HybridTTSEngine):
+                        active_tts_synthesizer = await self.tts_engine.get_active_engine_for_synthesis()
+                    elif hasattr(self.tts_engine, 'get_output_sample_rate'): # Direct engine
+                        active_tts_synthesizer = self.tts_engine
+                    
+                    if active_tts_synthesizer and await active_tts_synthesizer.is_healthy():
+                        current_tts_sample_rate_for_local_playback = active_tts_synthesizer.get_output_sample_rate()
+                        logger.info(f"TTS: Using {active_tts_synthesizer.__class__.__name__} with SR {current_tts_sample_rate_for_local_playback}Hz.")
+
+                        if self.is_websocket_active:
+                            await self.send_status("speaking_started", "Speaking...")
+                        else:
+                            logger.info(f"Synthesizing for local playback (SR: {current_tts_sample_rate_for_local_playback}Hz): '{response_text[:50]}...'")
+                        self.state = "speaking"
+
+                        async for tts_chunk in active_tts_synthesizer.synthesize_stream(response_text):
+                            if self.is_websocket_active:
+                                await self.send_tts_chunk(base64.b64encode(tts_chunk).decode('utf-8'))
+                            if self.local_audio_output_engine and self.local_audio_output_engine.is_enabled:
+                                tts_audio_bytes_for_local.extend(tts_chunk)
                         
-                        if resolved_command.get("executable") and \
-                           resolved_command.get("resolved_device_name_for_context_update"):
-                            self._last_mentioned_device_for_pronoun = resolved_command["resolved_device_name_for_context_update"]
-                            logger.debug(f"ConnectionManager: Updated pronoun context to '{self._last_mentioned_device_for_pronoun}'")
-                    else: # NLU found command, but no processor
-                        logger.warning("Offline NLU parsed a command, but no offline_processor is available.")
-                        response_text = "I understood an offline command, but cannot process it right now."
-                else: # NLU did not find a command (or NLU unavailable/failed) -> try offline LLM
-                    if self.offline_llm_logic_engine:
-                        logger.info("NLU did not identify a command / NLU unavailable. Trying offline LLM (Ollama).")
-                        lumi_response = await self.offline_llm_logic_engine.ask(text, thread_id=thread_id)
-                        response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
-                        if not response_text: response_text = "The offline assistant didn't provide a response."
-                    else: # No NLU command AND no offline LLM
-                        logger.info("NLU did not identify a command, and offline LLM is not available.")
-                        response_text = "I can only process specific commands offline, and this wasn't one of them. The general offline assistant is also unavailable."
-            
-            # TTS Synthesis
-            if response_text and self.tts_engine:
-                if self.is_websocket_active:
-                    await self.send_status("speaking_started", "Speaking...")
-                else:
-                    logger.info(f"Synthesizing for local playback: '{response_text[:50]}...'")
-                self.state = "speaking"
+                        if self.is_websocket_active: await self.send_tts_finished()
+                        
+                        if tts_audio_bytes_for_local and self.local_audio_output_engine and \
+                        self.local_audio_output_engine.is_enabled and not self.is_websocket_active:
+                            logger.info(f"Queueing {len(tts_audio_bytes_for_local)} bytes for local TTS (SR: {current_tts_sample_rate_for_local_playback}Hz).")
+                            self.local_audio_output_engine.play_tts_bytes(
+                                bytes(tts_audio_bytes_for_local),
+                                sample_rate=current_tts_sample_rate_for_local_playback
+                            )
+                    else:
+                        logger.error("TTS: No active and healthy synthesizer found or TTS engine is not correctly configured.")
+                        if self.is_websocket_active: await self.send_error("Sorry, I can't speak right now (TTS synth error).")
 
-                async for tts_chunk in self.tts_engine.synthesize_stream(response_text):
+                elif not response_text:
+                    logger.warning("No response text generated by any LLM/NLU path.")
                     if self.is_websocket_active:
-                        await self.send_tts_chunk(base64.b64encode(tts_chunk).decode('utf-8'))
-                    if self.local_audio_output_engine and self.local_audio_output_engine.is_enabled:
-                        tts_audio_bytes_for_local.extend(tts_chunk)
-                
-                if self.is_websocket_active: await self.send_tts_finished()
-                
-                if tts_audio_bytes_for_local and self.local_audio_output_engine and \
-                   self.local_audio_output_engine.is_enabled and not self.is_websocket_active:
-                    logger.info(f"Queueing {len(tts_audio_bytes_for_local)} bytes for local TTS.")
-                    if not self.local_audio_output_engine.is_running:
-                         self.local_audio_output_engine.start()
-                    self.local_audio_output_engine.play_tts_bytes(bytes(tts_audio_bytes_for_local))
-            
-            elif not response_text:
-                logger.warning("No response text generated by any LLM/NLU path.")
-                # Potentially send a generic "I don't know" if WS is active
-                if self.is_websocket_active:
-                    await self.send_error("Sorry, I could not process your request.")
+                        await self.send_error("Sorry, I could not process your request.")
+                elif not self.tts_engine:
+                    logger.error("TTS engine not configured, cannot speak response.")
+                    if self.is_websocket_active:
+                        await self.send_error("Sorry, I can't speak right now (TTS not configured).")
 
-
-        except asyncio.CancelledError:
-            logger.info("LLM/TTS/Offline background task cancelled.")
-        except Exception as e:
-            logger.error(f"Error in _run_llm_tts_or_offline: {e}", exc_info=True)
-            if self.is_websocket_active: # Send error only if WS active
-                await self.send_error(f"Error processing request: {str(e)}")
-        finally:
-            if self.state != "disconnected": 
-                self.state = "wakeword"
-                if self.is_websocket_active:
-                    await self.send_status("wakeword_listening", "Waiting for wake word...")
-                else:
-                    logger.info("Local: Waiting for wake word...")
-            self.llm_tts_task = None
+            except asyncio.CancelledError:
+                logger.info("LLM/TTS/Offline background task cancelled.")
+            except Exception as e:
+                logger.error(f"Error in _run_llm_tts_or_offline: {e}", exc_info=True)
+                if self.is_websocket_active: 
+                    await self.send_error(f"Error processing request: {str(e)}")
+            finally:
+                if self.state != "disconnected": 
+                    self.state = "wakeword"
+                    if self.is_websocket_active:
+                        await self.send_status("wakeword_listening", "Waiting for wake word...")
+                    else:
+                        logger.info("Local: Waiting for wake word...")
+                self.llm_tts_task = None
 
 
     async def process_audio(self, audio_chunk: bytes, thread_id: str, is_local_source: bool = False):
@@ -595,13 +635,10 @@ class ConnectionManager:
 
         if not all([self.wake_word_engine, self.vad_engine, self.stt_provider, self.stt_recognizer]):
             logger.error("Core audio processing engines not ready in ConnectionManager.")
-            if not is_local_source: await self.send_error("Server audio engines not ready.")
+            if not is_local_source and self.is_websocket_active : await self.send_error("Server audio engines not ready.")
             return
 
-        # Frame length check (use global audio settings for expected chunk structure)
-        # WakeWord and VAD engines should match this frame_length from global_audio_settings
-        # The input audio_chunk is raw bytes. Porcupine/Cobra need list of int16 samples.
-        bytes_per_sample = 2 # int16
+        bytes_per_sample = 2 
         expected_bytes = self.global_audio_settings.frame_length * bytes_per_sample
         
         if len(audio_chunk) != expected_bytes:
@@ -609,13 +646,11 @@ class ConnectionManager:
             return
         
         try:
-            # Unpack bytes into list of int16 samples for Picovoice engines
             pcm = struct.unpack_from(f"{self.global_audio_settings.frame_length}h", audio_chunk)
         except struct.error as e:
             logger.error(f"Audio chunk unpack error: {e}. Length: {len(audio_chunk)}")
             return
 
-        # --- State Machine ---
         if self.state == "wakeword":
             keyword_index = self.wake_word_engine.process(pcm)
             if keyword_index >= 0:
@@ -624,28 +659,37 @@ class ConnectionManager:
                 self.audio_buffer.clear()
                 self.silence_frames_count = 0
                 self.frames_in_listening = 0
-                self.stt_recognizer.reset()
+                if self.stt_recognizer: self.stt_recognizer.reset() # Ensure recognizer exists
+                else: 
+                    logger.error("STT recognizer not available after wake word detection!")
+                    if not is_local_source and self.is_websocket_active: await self.send_error("Server STT error.")
+                    self.state = "wakeword" # Revert state
+                    return
+
                 if self.is_websocket_active:
                     await self.send_status("listening_started", "Listening...")
-                else: # Local audio source
+                else: 
                      logger.info("Local: Listening started...")
-                     # If local, and output was stopped, ensure it's ready for TTS
                      if self.local_audio_output_engine and not self.local_audio_output_engine.is_running:
                          self.local_audio_output_engine.start()
 
 
         elif self.state == "listening":
-            self.frames_in_listening += 1
-            self.audio_buffer.extend(audio_chunk) # STT engines might want full buffer later
+            if not self.stt_recognizer: # Should not happen if checked above, but defensive
+                logger.error("STT recognizer not available in listening state!")
+                if not is_local_source and self.is_websocket_active: await self.send_error("Server STT error.")
+                self.state = "wakeword"
+                return
 
-            # STT processing
+            self.frames_in_listening += 1
+            self.audio_buffer.extend(audio_chunk) 
+
             self.stt_recognizer.accept_waveform(audio_chunk)
             partial_result_json = self.stt_recognizer.partial_result()
             partial_transcript = json.loads(partial_result_json).get("partial", "")
             if partial_transcript and self.is_websocket_active:
                 await self.send_transcript(partial_transcript, is_final=False)
 
-            # VAD processing
             voice_probability = self.vad_engine.process(pcm)
             is_voiced = voice_probability > self.vad_processing_settings.probability_threshold
 
@@ -654,8 +698,6 @@ class ConnectionManager:
             else:
                 self.silence_frames_count = 0
 
-            # End of speech conditions
-            # Use self.vad_processing_settings for these thresholds
             grace_over = self.frames_in_listening >= self.vad_processing_settings.min_listening_frames
             silence_met = self.silence_frames_count >= self.vad_processing_settings.silence_frames_threshold
             max_len_met = self.frames_in_listening >= self.vad_processing_settings.max_listening_frames
@@ -678,13 +720,11 @@ class ConnectionManager:
 
                 if final_transcript:
                     if self.llm_tts_task and not self.llm_tts_task.done():
-                        self.llm_tts_task.cancel() # Cancel previous if any
+                        self.llm_tts_task.cancel() 
                     self.llm_tts_task = asyncio.create_task(
                         self._run_llm_tts_or_offline(final_transcript, thread_id)
                     )
-                    # State change to 'processing' will happen inside the task
-                    # For responsiveness, we could set to 'wakeword' here, but the task manages it.
-                else: # No transcript
+                else: 
                     self.state = "wakeword"
                     if self.is_websocket_active:
                         await self.send_status("wakeword_listening", "No speech detected. Waiting for wake word...")
@@ -698,7 +738,7 @@ class ConnectionManager:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global manager # Access the global ConnectionManager instance
+    global manager 
     if not manager:
         logger.error("ConnectionManager not initialized for WebSocket endpoint.")
         await websocket.accept()
@@ -710,7 +750,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            message = await websocket.receive_json() # Assuming client sends JSON with audio
+            message = await websocket.receive_json() 
             if message.get("type") == "audio_chunk":
                 audio_b64 = message.get("data")
                 if audio_b64:
@@ -719,16 +759,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         await manager.process_audio(audio_bytes, ASSISTANT_THREAD_ID, is_local_source=False)
                     except (base64.binascii.Error, TypeError) as e:
                         logger.error(f"Invalid base64 audio data: {e}")
-                        await manager.send_error("Invalid audio data.")
+                        if manager.is_websocket_active: await manager.send_error("Invalid audio data.")
                     except Exception as e:
                          logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
-                         await manager.send_error("Server error processing audio.")
-            # Handle other message types if any (e.g., client config, stop commands)
+                         if manager.is_websocket_active: await manager.send_error("Server error processing audio.")
+            
     except WebSocketDisconnect as e:
         logger.info(f"WebSocket disconnected: code={e.code}, reason='{e.reason}'")
     except Exception as e:
         logger.error(f"WebSocket Error: {e}", exc_info=True)
-        if manager and manager.is_websocket_active: # Try to send error if still connected conceptually
+        if manager and manager.is_websocket_active: 
             await manager.send_error(f"Unexpected WebSocket error: {str(e)}")
     finally:
         if manager: await manager.disconnect()
@@ -738,7 +778,6 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting Lumi Voice Assistant server (Modular) on {settings.webapp.host}:{settings.webapp.port}")
     
-    # Log local audio device info if enabled
     if settings.sounddevice.enabled:
         try:
             import sounddevice as sd
@@ -746,7 +785,17 @@ if __name__ == "__main__":
             logger.info(f"\n{sd.query_devices()}")
             logger.info(f"Using Input Device Index: {settings.sounddevice.input_device_index if settings.sounddevice.input_device_index is not None else 'Default'}")
             logger.info(f"Using Output Device Index: {settings.sounddevice.output_device_index if settings.sounddevice.output_device_index is not None else 'Default'}")
+            logger.info(f"SoundDevice TTS Output Sample Rate: {settings.sounddevice.tts_output_sample_rate} Hz")
         except Exception as e:
             logger.warning(f"Could not list audio devices on startup: {e}")
+    
+    # Log Gemini specific info
+    if settings.engines.tts_engine == "hybrid" or settings.engines.tts_engine == "gemini":
+        logger.info(f"Gemini TTS configured with model: {settings.gemini_tts.model}, voice: {settings.gemini_tts.voice_name}")
+        if not settings.gemini_tts.api_key:
+            logger.warning("GEMINI_API_KEY is not set. Gemini TTS will not function.")
+        else:
+            logger.info("GEMINI_API_KEY is set.")
+
 
     uvicorn.run(app, host=settings.webapp.host, port=settings.webapp.port)
