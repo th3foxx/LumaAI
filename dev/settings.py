@@ -111,6 +111,8 @@ class AudioSettings:
     sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", 16000))
     channels: int = int(os.getenv("AUDIO_CHANNELS", 1))
     frame_length: int = int(os.getenv("AUDIO_FRAME_LENGTH", 512)) # Samples per frame
+    play_activation_sound: bool = os.getenv("PLAY_ACTIVATION_SOUND", "True").lower() in ("true", "1", "t")
+    activation_sound_path: Optional[str] = os.getenv("ACTIVATION_SOUND_PATH", "sounds/activation.wav")
 
 
 @dataclass(frozen=True)
