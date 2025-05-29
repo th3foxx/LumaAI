@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class AudioOutputEngineBase(ABC):
     @abstractmethod
@@ -7,7 +7,7 @@ class AudioOutputEngineBase(ABC):
         pass
 
     @abstractmethod
-    def play_tts_bytes(self, audio_bytes: bytes):
+    def play_tts_bytes(self, audio_bytes: bytes, sample_rate: Optional[int] = None):
         pass
 
     @abstractmethod

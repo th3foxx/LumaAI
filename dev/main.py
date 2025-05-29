@@ -19,7 +19,6 @@ from connectivity import is_internet_available
 from tools.scheduler import init_db as init_scheduler_db
 from utils.music_db import init_music_likes_table
 from services.reminder_checker import start_reminder_checker, stop_reminder_checker
-# from offline_controller import parse_offline_command, execute_offline_command # Now part of NLU engine
 
 # Engine imports
 from engines.wake_word.base import WakeWordEngineBase
@@ -32,14 +31,13 @@ from engines.audio_io.input_base import AudioInputEngineBase, ProcessAudioCallba
 from engines.audio_io.output_base import AudioOutputEngineBase
 from engines.communication.base import CommunicationServiceBase
 
-# Engine factory (simple example)
-# In a larger app, this could be more sophisticated, e.g., using plugin patterns
+# Engine factory
 from engines.wake_word.picovoice_porcupine import PicovoicePorcupineEngine
 from engines.vad.picovoice_cobra import PicovoiceCobraEngine
 from engines.stt.vosk_stt import VoskSTTEngine
 from engines.tts.paroli_tts import ParoliTTSEngine
-from engines.tts.gemini_tts import GeminiTTSEngine # NEW
-from engines.tts.hybrid_tts import HybridTTSEngine # NEW
+from engines.tts.gemini_tts import GeminiTTSEngine
+from engines.tts.hybrid_tts import HybridTTSEngine
 from engines.nlu.rasa_nlu import RasaNLUEngine
 from engines.llm_logic.langgraph_llm import LangGraphLLMEngine
 from engines.llm_logic.ollama_llm import OllamaLLMEngine
@@ -48,36 +46,27 @@ from engines.communication.mqtt_service import MQTTService
 from engines.offline_processing.base import OfflineCommandProcessorBase
 from engines.offline_processing.default_processor import DefaultOfflineCommandProcessor
 
-# Tools for LLM (used by LangGraphLLMEngine, which imports them itself)
-# from tools.device_control import set_device_attribute (tool itself uses comm_service)
-# from tools.time import get_current_time
-
-# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Global Engine Instances ---
-# These will be initialized in the lifespan manager
 wake_word_engine: Optional[WakeWordEngineBase] = None
 vad_engine: Optional[VADEngineBase] = None
-stt_engine: Optional[STTRecognizerProvider] = None # Provides recognizer instances
-tts_engine: Optional[TTSEngineBase] = None # This will be the HybridTTSEngine
+stt_engine: Optional[STTRecognizerProvider] = None
+tts_engine: Optional[TTSEngineBase] = None
 nlu_engine: Optional[NLUEngineBase] = None
 llm_logic_engine: Optional[LLMLogicEngineBase] = None
-offline_llm_logic_engine: Optional[LLMLogicEngineBase] = None # For offline logic (e.g., Ollama)
+offline_llm_logic_engine: Optional[LLMLogicEngineBase] = None
 audio_input_engine: Optional[AudioInputEngineBase] = None
 audio_output_engine: Optional[AudioOutputEngineBase] = None
-comm_service: Optional[CommunicationServiceBase] = None # e.g., MQTT
+comm_service: Optional[CommunicationServiceBase] = None
 offline_command_processor: Optional[OfflineCommandProcessorBase] = None
 
-# --- Connection Manager (WebSocket Handler) ---
-# Forward declaration for type hint in process_audio_wrapper
 class ConnectionManager: pass
-manager: Optional[ConnectionManager] = None # Global instance, initialized in lifespan
+manager: Optional[ConnectionManager] = None
 
-ASSISTANT_THREAD_ID = "lumi-voice-assistant-session" # For LLM context
+ASSISTANT_THREAD_ID = "lumi-voice-assistant-session"
 
-def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings) -> Optional[Any]: # Return type Any for flexibility
+def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings) -> Optional[Any]:
     logger.info(f"Creating engine: {engine_name} of type {engine_type}")
     try:
         if engine_type == "wake_word":
@@ -93,35 +82,28 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
             if engine_name == "vosk":
                 return VoskSTTEngine(
                     model_path=global_settings.vosk.model_path,
-                    sample_rate=global_settings.vosk.sample_rate # Vosk specific sample rate
+                    sample_rate=global_settings.vosk.sample_rate
                 )
         elif engine_type == "tts":
             if engine_name == "paroli":
                 return ParoliTTSEngine(config=global_settings.paroli_server)
             elif engine_name == "gemini":
-                # GeminiTTSEngine expects GeminiTTSSettings instance
-                if not global_settings.gemini_tts.api_key: # Check API key early
+                if not global_settings.gemini_tts.api_key:
                      logger.warning("Gemini TTS engine selected, but API key is missing in settings. It will likely fail.")
                 return GeminiTTSEngine(config=global_settings.gemini_tts)
             elif engine_name == "hybrid":
                 online_provider_name = global_settings.engines.tts_online_provider
                 offline_provider_name = global_settings.engines.tts_offline_provider
-
                 logger.info(f"Creating Hybrid TTS: Online provider='{online_provider_name}', Offline provider='{offline_provider_name}'")
-
-                # Recursively create provider instances
                 online_tts_instance = create_engine_instance("tts", online_provider_name, global_settings)
                 offline_tts_instance = create_engine_instance("tts", offline_provider_name, global_settings)
-
                 if not online_tts_instance:
                     logger.warning(f"Hybrid TTS: Online provider '{online_provider_name}' failed to initialize.")
                 if not offline_tts_instance:
                     logger.warning(f"Hybrid TTS: Offline provider '{offline_provider_name}' failed to initialize.")
-                
                 if not online_tts_instance and not offline_tts_instance:
                     logger.error("Hybrid TTS: Both online and offline providers failed to initialize. Hybrid TTS will not be functional.")
-                    return None # Critical failure for hybrid if no providers
-
+                    return None
                 return HybridTTSEngine(config={
                     "online_engine": online_tts_instance,
                     "offline_engine": offline_tts_instance
@@ -145,7 +127,7 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
         elif engine_type == "audio_input":
             if engine_name == "sounddevice":
                 return SoundDeviceInputEngine(
-                    process_audio_callback=None,
+                    process_audio_callback=None, # Will be set later
                     loop=asyncio.get_running_loop(),
                     config={
                         "sounddevice_settings": global_settings.sounddevice,
@@ -193,17 +175,14 @@ async def initialize_global_engines(app_settings: Settings):
     wake_word_engine = create_engine_instance("wake_word", app_settings.engines.wake_word_engine, app_settings)
     vad_engine = create_engine_instance("vad", app_settings.engines.vad_engine, app_settings)
     stt_engine = create_engine_instance("stt", app_settings.engines.stt_engine, app_settings)
-    
-    # TTS Engine (potentially Hybrid)
     tts_engine = create_engine_instance("tts", app_settings.engines.tts_engine, app_settings)
-    
     nlu_engine = create_engine_instance("nlu", app_settings.engines.nlu_engine, app_settings)
     llm_logic_engine = create_engine_instance("llm_logic", app_settings.engines.llm_logic_engine, app_settings)
     offline_llm_logic_engine = create_engine_instance("offline_llm_logic", app_settings.engines.offline_llm_engine, app_settings)
     
     if not all([wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine, comm_service]):
         logger.critical("One or more core processing or communication engines failed to initialize. Functionality will be severely limited.")
-    if not tts_engine: # Specifically check tts_engine after its creation attempt
+    if not tts_engine:
         logger.critical("TTS Engine (potentially Hybrid) failed to initialize. TTS functionality will be unavailable.")
     if not llm_logic_engine:
         logger.warning("Online LLM logic engine failed to initialize. Online general queries will not work.")
@@ -216,13 +195,13 @@ async def initialize_global_engines(app_settings: Settings):
         wake_word_engine=wake_word_engine,
         vad_engine=vad_engine,
         stt_provider=stt_engine,
-        tts_engine=tts_engine, # This is now the Hybrid Engine
+        tts_engine=tts_engine,
         nlu_engine=nlu_engine,
         llm_logic_engine=llm_logic_engine,
         offline_llm_logic_engine=offline_llm_logic_engine,
         comm_service=comm_service,
         offline_processor=offline_command_processor,
-        global_audio_settings=app_settings.audio, # Pass full AudioSettings
+        global_audio_settings=app_settings.audio,
         vad_processing_settings=app_settings.vad_config
     )
     logger.info("ConnectionManager initialized.")
@@ -232,7 +211,7 @@ async def initialize_global_engines(app_settings: Settings):
         async def process_audio_wrapper(audio_chunk: bytes):
             if manager:
                 await manager.process_audio(audio_chunk, ASSISTANT_THREAD_ID, is_local_source=True)
-        _audio_input_engine_instance._process_audio_cb = process_audio_wrapper
+        _audio_input_engine_instance._process_audio_cb = process_audio_wrapper # type: ignore
         audio_input_engine = _audio_input_engine_instance
         logger.info(f"AudioInputEngine ({app_settings.engines.audio_input_engine}) created.")
         if audio_input_engine and audio_input_engine.is_enabled:
@@ -254,31 +233,19 @@ async def initialize_global_engines(app_settings: Settings):
     else:
         logger.info(f"AudioOutputEngine ({app_settings.engines.audio_output_engine}) is disabled or failed to initialize.")
 
-    # Startup for engines that need it (TTS server, LLM DB connections, MQTT)
-    # comm_service already started up
-    if tts_engine: await tts_engine.startup() # This will call startup on Hybrid, then on Gemini and Paroli
+    if tts_engine: await tts_engine.startup()
     if llm_logic_engine: await llm_logic_engine.startup()
-    if offline_llm_logic_engine: await offline_llm_logic_engine.startup() # Ensure offline LLM also starts up if configured
+    if offline_llm_logic_engine: await offline_llm_logic_engine.startup()
 
     logger.info("Global engines initialization phase complete.")
 
 
 async def shutdown_global_engines():
     logger.info("Shutting down global engines...")
-    # Order might matter for dependencies, shutdown in reverse order of startup is a good heuristic
     engine_list = [
-        # Higher level / composite engines first
-        tts_engine, # Hybrid engine, will call shutdown on its components
-        # LLMs
-        llm_logic_engine, offline_llm_logic_engine,
-        # NLU
-        nlu_engine,
-        # Audio processing pipeline components
-        wake_word_engine, vad_engine, stt_engine,
-        # IO Engines
-        audio_input_engine, audio_output_engine,
-        # Communication
-        comm_service
+        tts_engine, llm_logic_engine, offline_llm_logic_engine, nlu_engine,
+        wake_word_engine, vad_engine, stt_engine, audio_input_engine, 
+        audio_output_engine, comm_service
     ]
     for engine in engine_list:
         if engine and hasattr(engine, "shutdown"):
@@ -294,7 +261,6 @@ async def shutdown_global_engines():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase beginning...")
-
     try:
         init_scheduler_db()
         init_music_likes_table()
@@ -303,11 +269,11 @@ async def lifespan(app: FastAPI):
 
     await initialize_global_engines(settings)
 
-    global tts_engine, audio_output_engine
-    if tts_engine and audio_output_engine and await tts_engine.is_healthy() and audio_output_engine.is_enabled: # Check tts_engine health
+    global tts_engine, audio_output_engine # manager is already global
+    if tts_engine and audio_output_engine and await tts_engine.is_healthy() and audio_output_engine.is_enabled:
         if not settings.scheduler_db_path:
             logger.warning("Scheduler DB path not set. Reminder checker might not function correctly.")
-        await start_reminder_checker(tts_engine, audio_output_engine) # tts_engine is Hybrid
+        await start_reminder_checker(tts_engine, audio_output_engine)
     else:
         logger.warning("TTS or Audio Output engine not available/healthy, reminder checker not started.")
 
@@ -333,13 +299,21 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Ensure the 'static' directory exists at the root of your project or adjust path
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if not os.path.exists(static_dir):
+    os.makedirs(static_dir, exist_ok=True)
+    logger.info(f"Created static directory at: {static_dir}")
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
 
 @app.get("/")
 async def get_root():
-    static_file_path = os.path.join("static", "index.html")
+    static_file_path = os.path.join(static_dir, "index.html")
     if not os.path.exists(static_file_path):
-        raise HTTPException(status_code=404, detail="Frontend file not found.")
+        # Fallback or more informative error
+        logger.error(f"Frontend file not found at: {static_file_path}")
+        return HTTPException(status_code=404, detail=f"Frontend file 'index.html' not found in '{static_dir}'. Please ensure it exists.")
     from fastapi.responses import FileResponse
     return FileResponse(static_file_path)
 
@@ -354,8 +328,8 @@ class ConnectionManager:
                  offline_llm_logic_engine: Optional[LLMLogicEngineBase],
                  comm_service: Optional[CommunicationServiceBase],
                  offline_processor: Optional[OfflineCommandProcessorBase],
-                 global_audio_settings: AudioSettings, # Use specific AudioSettings type
-                 vad_processing_settings: "VADSettings"): # type: ignore
+                 global_audio_settings: AudioSettings,
+                 vad_processing_settings: "settings.VADSettings"): # type: ignore
 
         self.wake_word_engine = wake_word_engine
         self.vad_engine = vad_engine
@@ -367,7 +341,7 @@ class ConnectionManager:
         self.comm_service = comm_service
         self.offline_processor = offline_processor
         self._last_mentioned_device_for_pronoun: Optional[str] = None
-        self.global_audio_settings = global_audio_settings # Store full AudioSettings
+        self.global_audio_settings = global_audio_settings
         self.vad_processing_settings = vad_processing_settings
 
         self.websocket: Optional[WebSocket] = None
@@ -378,16 +352,13 @@ class ConnectionManager:
         self.frames_in_listening: int = 0
         self.llm_tts_task: Optional[asyncio.Task] = None
         self.is_websocket_active: bool = False
-
         self.local_audio_output_engine: Optional[AudioOutputEngineBase] = None
 
-        # Состояния для адаптивного VAD и "залипания"
         self.estimated_noise_floor: float = self.vad_processing_settings.probability_threshold
         self.current_dynamic_vad_threshold: float = self.vad_processing_settings.probability_threshold
         self.potential_silence_frames: int = 0
         self.was_recently_voiced: bool = False
 
-        # Activation sound
         self.activation_sound_bytes: Optional[bytes] = None
         self.activation_sound_sample_rate: Optional[int] = None
         self.activation_sound_channels: Optional[int] = None
@@ -396,40 +367,31 @@ class ConnectionManager:
         try:
             if self.global_audio_settings.play_activation_sound and self.global_audio_settings.activation_sound_path:
                 sound_path = self.global_audio_settings.activation_sound_path
-                if os.path.exists(sound_path):
+                if sound_path and os.path.exists(sound_path): # Check if sound_path is not None
                     with wave.open(sound_path, 'rb') as wf:
                         self.activation_sound_bytes = wf.readframes(wf.getnframes())
                         self.activation_sound_sample_rate = wf.getframerate()
                         self.activation_sound_channels = wf.getnchannels()
                         self.activation_sound_sampwidth = wf.getsampwidth()
-
-                        logger.info(f"Activation sound loaded: {sound_path}, "
-                                    f"SR={self.activation_sound_sample_rate}Hz, Channels={self.activation_sound_channels}, "
-                                    f"Width={self.activation_sound_sampwidth}bytes, Size={len(self.activation_sound_bytes)} bytes")
-
+                        logger.info(f"Activation sound loaded: {sound_path}, SR={self.activation_sound_sample_rate}Hz, Channels={self.activation_sound_channels}, Width={self.activation_sound_sampwidth}bytes, Size={len(self.activation_sound_bytes)} bytes")
                         if self.activation_sound_channels != 1:
-                            logger.warning(f"Activation sound '{sound_path}' is not mono ({self.activation_sound_channels} channels). "
-                                           "Local playback via SoundDeviceOutputEngine expects mono. Playback might be suboptimal or fail if not handled by output engine.")
-                        if self.activation_sound_sampwidth != 2: # 2 bytes for int16
-                            logger.warning(f"Activation sound '{sound_path}' sample width is {self.activation_sound_sampwidth} bytes. "
-                                           "Local playback via SoundDeviceOutputEngine expects 2 bytes (int16). Playback might be incorrect or fail.")
-                else:
-                    logger.warning(f"Activation sound file not found: {sound_path}. Activation sound will not be played.")
+                            logger.warning(f"Activation sound '{sound_path}' is not mono. Playback might be suboptimal.")
+                        if self.activation_sound_sampwidth != 2:
+                            logger.warning(f"Activation sound '{sound_path}' sample width is {self.activation_sound_sampwidth} bytes (expected 2 for int16). Playback might be incorrect.")
+                elif sound_path: # sound_path was set but file doesn't exist
+                     logger.warning(f"Activation sound file not found: {sound_path}. Activation sound will not be played.")
+                else: # activation_sound_path was None
+                    logger.warning("Activation sound path is None. Activation sound will not be played.")
             elif self.global_audio_settings.play_activation_sound:
-                logger.warning("Activation sound is enabled but no path is specified (ACTIVATION_SOUND_PATH).")
-
+                logger.warning("Activation sound is enabled but no path is specified or found (ACTIVATION_SOUND_PATH).")
         except Exception as e:
             logger.error(f"Failed to load activation sound: {e}", exc_info=True)
-            self.activation_sound_bytes = None
-            self.activation_sound_sample_rate = None
-
+            self.activation_sound_bytes = None # Ensure it's None on failure
 
         if self.wake_word_engine and self.global_audio_settings.frame_length != self.wake_word_engine.frame_length:
-            logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) "
-                           f"differs from WakeWord frame length ({self.wake_word_engine.frame_length}). Ensure input matches WW.")
+            logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) differs from WakeWord frame length ({self.wake_word_engine.frame_length}).")
         if self.vad_engine and self.global_audio_settings.frame_length != self.vad_engine.frame_length:
-            logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) "
-                           f"differs from VAD frame length ({self.vad_engine.frame_length}).")
+            logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) differs from VAD frame length ({self.vad_engine.frame_length}).")
         if self.stt_provider:
             try:
                 self.stt_recognizer = self.stt_provider.create_recognizer()
@@ -445,8 +407,9 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         global audio_input_engine, audio_output_engine
         if self.websocket is not None and self.websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.accept()
-            await websocket.close(code=1008, reason="Server busy")
+            logger.warning("Another WebSocket client tried to connect while one is active. Rejecting.")
+            await websocket.accept() # Must accept before closing with a reason
+            await websocket.close(code=1008, reason="Server busy. Another client is connected.")
             return False
 
         await websocket.accept()
@@ -462,31 +425,32 @@ class ConnectionManager:
             logger.info("WebSocket connected, pausing local audio input.")
             audio_input_engine.pause()
         if audio_output_engine and audio_output_engine.is_enabled:
-            logger.info("WebSocket connected, stopping any local audio output.")
-            audio_output_engine.stop() # Stop to ensure it doesn't interfere
+            logger.info("WebSocket connected, stopping any local audio output queue.")
+            audio_output_engine.stop() # Stop to clear queue and ensure it doesn't interfere
 
         if not self.stt_provider:
             logger.error("STT provider not available!")
             await self.send_error("Server STT error.")
-            await self.disconnect(code=1011)
+            await self.disconnect(code=1011, reason="Server STT error") # Pass reason
             return False
         
         try:
-            if not self.stt_recognizer:
+            if not self.stt_recognizer: # Should have been created in __init__
+                logger.warning("STT recognizer was not created in __init__, attempting now.")
                 self.stt_recognizer = self.stt_provider.create_recognizer()
-                logger.info("STT recognizer created.")
+                logger.info("STT recognizer created on connect.")
             else:
                 self.stt_recognizer.reset()
-                logger.info("STT recognizer reset.")
+                logger.info("STT recognizer reset on connect.")
         except Exception as e:
             logger.error(f"Failed to create/reset STT recognizer: {e}", exc_info=True)
             await self.send_error("Server STT engine failure.")
-            await self.disconnect(code=1011)
+            await self.disconnect(code=1011, reason="Server STT engine failure")
             return False
         
         if not self.tts_engine or not await self.tts_engine.is_healthy():
-            logger.error("TTS engine not available or not healthy!")
-            await self.send_error("Server TTS error.")
+            logger.warning("TTS engine not available or not healthy! TTS might not work.")
+            await self.send_status("tts_warning", "TTS engine might be unavailable.")
 
 
         logger.info("Client connected via WebSocket.")
@@ -495,41 +459,50 @@ class ConnectionManager:
 
     async def disconnect(self, code: int = 1000, reason: str = "Client disconnected"):
         global audio_input_engine, audio_output_engine
-        self.is_websocket_active = False
+        self.is_websocket_active = False # Set this first
 
         if self.llm_tts_task and not self.llm_tts_task.done():
             self.llm_tts_task.cancel()
             try: await self.llm_tts_task
             except asyncio.CancelledError: logger.info("LLM/TTS task cancelled on disconnect.")
-            except Exception as e: logger.error(f"Error during LLM/TTS task cancellation: {e}")
+            except Exception as e: logger.error(f"Error during LLM/TTS task cancellation on disconnect: {e}")
         self.llm_tts_task = None
 
         if self.websocket:
-            ws = self.websocket
-            self.websocket = None
-            if ws.client_state == WebSocketState.CONNECTED:
-                try: await ws.close(code=code, reason=reason)
-                except Exception as e: logger.warning(f"Error closing WebSocket: {e}")
+            ws_temp = self.websocket
+            self.websocket = None # Nullify before trying to close
+            if ws_temp.client_state == WebSocketState.CONNECTED:
+                try:
+                    logger.info(f"Closing WebSocket with code {code} and reason '{reason}'")
+                    await ws_temp.close(code=code, reason=reason)
+                except Exception as e:
+                    logger.warning(f"Error closing WebSocket: {e}")
+            elif ws_temp.client_state != WebSocketState.DISCONNECTED:
+                 logger.info(f"WebSocket was in state {ws_temp.client_state}, not attempting close.")
         
-        self.state = "disconnected"
+        current_state = self.state
+        self.state = "disconnected" # Final state after cleanup
 
-        logger.info(f"WebSocket client disconnected. Code: {code}, Reason: {reason}")
+        logger.info(f"WebSocket client disconnected (previous state: {current_state}). Code: {code}, Reason: {reason}")
 
         if audio_input_engine and audio_input_engine.is_enabled:
             logger.info("WebSocket disconnected, resuming local audio input.")
             if not audio_input_engine.is_running: audio_input_engine.start()
             audio_input_engine.resume()
-            self.state = "wakeword"
+            self.state = "wakeword" # Transition back to wakeword for local mode
             logger.info("Local audio interface active, waiting for wake word.")
         if audio_output_engine and audio_output_engine.is_enabled:
             if not audio_output_engine.is_running: audio_output_engine.start()
-
 
     async def _send_json(self, data: dict):
         if self.is_websocket_active and self.websocket and self.websocket.client_state == WebSocketState.CONNECTED:
             try:
                 await self.websocket.send_json(data)
                 return True
+            except WebSocketDisconnect:
+                logger.warning("WebSocket disconnected while trying to send JSON. Client might have closed connection.")
+                await self.disconnect(reason="WebSocket disconnected during send")
+                return False
             except Exception as e:
                  logger.error(f"Error sending JSON to client: {e}")
                  return False
@@ -541,6 +514,15 @@ class ConnectionManager:
     async def send_transcript(self, transcript: str, is_final: bool):
          await self._send_json({"type": "transcript", "text": transcript, "is_final": is_final})
 
+    async def send_tts_info(self, sample_rate: int, channels: int = 1, bit_depth: int = 16): # Added
+        if self.is_websocket_active:
+            await self._send_json({
+                "type": "tts_info",
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "bit_depth": bit_depth # Assuming 16-bit PCM for now
+            })
+
     async def send_tts_chunk(self, audio_chunk_b64: str):
         if self.is_websocket_active:
             await self._send_json({"type": "tts_chunk", "data": audio_chunk_b64})
@@ -551,13 +533,13 @@ class ConnectionManager:
 
     async def send_error(self, error_message: str):
         logger.error(f"Sending error to client: {error_message}")
-        if self.is_websocket_active:
+        if self.is_websocket_active: # Check active before sending
             await self._send_json({"type": "error", "message": error_message})
     
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
             response_text = ""
             tts_audio_bytes_for_local = bytearray()
-            current_tts_sample_rate_for_local_playback = None
+            current_tts_sample_rate_for_playback = None # Unified for local and WS
             
             try:
                 if self.is_websocket_active:
@@ -574,7 +556,6 @@ class ConnectionManager:
                     lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
                     response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
                     if not response_text: response_text = "Sorry, I didn't get a response from the online assistant."
-
                 else:
                     logger.info(f"Offline processing path activated (Internet: {online_capable}, Online Mode: {settings.ai.online_mode}).")
                     nlu_result = None
@@ -589,7 +570,6 @@ class ConnectionManager:
                                 nlu_result, self._last_mentioned_device_for_pronoun
                             )
                             response_text = await self.offline_processor.execute_resolved_command(resolved_command)
-                            
                             if resolved_command.get("executable") and \
                             resolved_command.get("resolved_device_name_for_context_update"):
                                 self._last_mentioned_device_for_pronoun = resolved_command["resolved_device_name_for_context_update"]
@@ -611,17 +591,21 @@ class ConnectionManager:
                     active_tts_synthesizer = None
                     if isinstance(self.tts_engine, HybridTTSEngine):
                         active_tts_synthesizer = await self.tts_engine.get_active_engine_for_synthesis()
-                    elif hasattr(self.tts_engine, 'get_output_sample_rate'):
+                    elif hasattr(self.tts_engine, 'get_output_sample_rate'): # Check if it's a standalone engine
                         active_tts_synthesizer = self.tts_engine
                     
                     if active_tts_synthesizer and await active_tts_synthesizer.is_healthy():
-                        current_tts_sample_rate_for_local_playback = active_tts_synthesizer.get_output_sample_rate()
-                        logger.info(f"TTS: Using {active_tts_synthesizer.__class__.__name__} with SR {current_tts_sample_rate_for_local_playback}Hz.")
+                        current_tts_sample_rate_for_playback = active_tts_synthesizer.get_output_sample_rate()
+                        logger.info(f"TTS: Using {active_tts_synthesizer.__class__.__name__} with SR {current_tts_sample_rate_for_playback}Hz.")
+
+                        # Send TTS info to WebSocket client
+                        if self.is_websocket_active and current_tts_sample_rate_for_playback:
+                            await self.send_tts_info(sample_rate=current_tts_sample_rate_for_playback)
 
                         if self.is_websocket_active:
                             await self.send_status("speaking_started", "Speaking...")
                         else:
-                            logger.info(f"Synthesizing for local playback (SR: {current_tts_sample_rate_for_local_playback}Hz): '{response_text[:50]}...'")
+                            logger.info(f"Synthesizing for local playback (SR: {current_tts_sample_rate_for_playback}Hz): '{response_text[:50]}...'")
                         self.state = "speaking"
 
                         async for tts_chunk in active_tts_synthesizer.synthesize_stream(response_text):
@@ -634,10 +618,10 @@ class ConnectionManager:
                         
                         if tts_audio_bytes_for_local and self.local_audio_output_engine and \
                         self.local_audio_output_engine.is_enabled and not self.is_websocket_active:
-                            logger.info(f"Queueing {len(tts_audio_bytes_for_local)} bytes for local TTS (SR: {current_tts_sample_rate_for_local_playback}Hz).")
+                            logger.info(f"Queueing {len(tts_audio_bytes_for_local)} bytes for local TTS (SR: {current_tts_sample_rate_for_playback}Hz).")
                             self.local_audio_output_engine.play_tts_bytes(
                                 bytes(tts_audio_bytes_for_local),
-                                sample_rate=current_tts_sample_rate_for_local_playback
+                                sample_rate=current_tts_sample_rate_for_playback
                             )
                     else:
                         logger.error("TTS: No active and healthy synthesizer found or TTS engine is not correctly configured.")
@@ -656,10 +640,10 @@ class ConnectionManager:
                 logger.info("LLM/TTS/Offline background task cancelled.")
             except Exception as e:
                 logger.error(f"Error in _run_llm_tts_or_offline: {e}", exc_info=True)
-                if self.is_websocket_active:
+                if self.is_websocket_active: # Check before sending
                     await self.send_error(f"Error processing request: {str(e)}")
             finally:
-                if self.state != "disconnected":
+                if self.state != "disconnected": # Ensure we don't revert state if already disconnected
                     self.state = "wakeword"
                     if self.is_websocket_active:
                         await self.send_status("wakeword_listening", "Waiting for wake word...")
@@ -680,7 +664,12 @@ class ConnectionManager:
         expected_bytes = self.global_audio_settings.frame_length * bytes_per_sample
 
         if len(audio_chunk) != expected_bytes:
-            logger.warning(f"Audio chunk size mismatch: got {len(audio_chunk)}, expected {expected_bytes}. Skipping.")
+            # This can happen with AudioWorklet if block sizes vary, though it tries to send fixed chunks.
+            # For local SoundDevice, it should always match.
+            logger.debug(f"Audio chunk size mismatch: got {len(audio_chunk)}, expected {expected_bytes}. Buffering or adjusting might be needed if persistent.")
+            # For now, we'll skip if it's not the exact size expected by WW/VAD.
+            # More robust handling might involve an internal buffer in ConnectionManager
+            # to re-chunk audio to the correct frame_length.
             return
 
         try:
@@ -694,21 +683,17 @@ class ConnectionManager:
             if keyword_index >= 0:
                 logger.info("Wake word detected!")
 
-                # Play activation sound
-                if self.global_audio_settings.play_activation_sound and \
-                   self.activation_sound_bytes and self.activation_sound_sample_rate:
-                    if not self.is_websocket_active and self.local_audio_output_engine and self.local_audio_output_engine.is_enabled:
+                if self.global_audio_settings.play_activation_sound:
+                    if self.is_websocket_active:
+                        logger.info("Sending cue to client to play activation sound.")
+                        await self.send_status("play_activation_sound_cue", "Client should play activation sound.")
+                    elif self.activation_sound_bytes and self.activation_sound_sample_rate and \
+                         self.local_audio_output_engine and self.local_audio_output_engine.is_enabled:
                         logger.info(f"Playing activation sound locally (SR: {self.activation_sound_sample_rate}Hz).")
                         self.local_audio_output_engine.play_tts_bytes(
                             self.activation_sound_bytes,
                             sample_rate=self.activation_sound_sample_rate
                         )
-                        # Small delay to allow sound to start playing, especially if system is very fast.
-                        # Adjust if needed, or rely on natural processing delays.
-                        # await asyncio.sleep(0.05) # Optional: if sound gets cut early
-                    elif self.is_websocket_active:
-                        logger.info("Sending cue to client to play activation sound.")
-                        await self.send_status("play_activation_sound_cue", "Client should play activation sound.")
                 
                 self.state = "listening"
                 self.audio_buffer.clear()
@@ -723,17 +708,15 @@ class ConnectionManager:
                 else:
                     logger.error("STT recognizer not available after wake word detection!")
                     if not is_local_source and self.is_websocket_active: await self.send_error("Server STT error.")
-                    self.state = "wakeword" # Revert state
+                    self.state = "wakeword"
                     return
 
                 if self.is_websocket_active:
                     await self.send_status("listening_started", "Listening...")
                 else:
                      logger.info("Local: Listening started...")
-                     # Ensure local audio output is running if it was stopped (e.g., by WebSocket disconnect)
                      if self.local_audio_output_engine and not self.local_audio_output_engine.is_running:
                          self.local_audio_output_engine.start()
-
 
         elif self.state == "listening":
             if not self.stt_recognizer:
@@ -759,7 +742,6 @@ class ConnectionManager:
                     self.estimated_noise_floor = (1 - self.vad_processing_settings.noise_floor_alpha) * self.estimated_noise_floor + \
                                                  self.vad_processing_settings.noise_floor_alpha * voice_probability
                     self.estimated_noise_floor = max(0.0, min(self.estimated_noise_floor, 1.0))
-
                 self.current_dynamic_vad_threshold = self.estimated_noise_floor + self.vad_processing_settings.threshold_margin_factor
                 self.current_dynamic_vad_threshold = max(self.vad_processing_settings.min_dynamic_threshold,
                                                          min(self.current_dynamic_vad_threshold, self.vad_processing_settings.max_dynamic_threshold))
@@ -803,11 +785,12 @@ class ConnectionManager:
 
                 if final_transcript:
                     if self.llm_tts_task and not self.llm_tts_task.done():
+                        logger.warning("New final transcript received while previous LLM/TTS task was running. Cancelling old task.")
                         self.llm_tts_task.cancel()
                     self.llm_tts_task = asyncio.create_task(
                         self._run_llm_tts_or_offline(final_transcript, thread_id)
                     )
-                else:
+                else: # No final transcript (e.g. only silence)
                     self.state = "wakeword"
                     if self.is_websocket_active:
                         await self.send_status("wakeword_listening", "No speech detected. Waiting for wake word...")
@@ -831,32 +814,55 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     connected = await manager.connect(websocket)
-    if not connected: return
+    if not connected:
+        logger.info("WebSocket connection attempt failed or was rejected by ConnectionManager.")
+        return # connect() already handled closing the websocket if it was accepted then rejected
 
     try:
-        while True:
+        while True: # manager.is_websocket_active and manager.websocket: # Check if manager still considers it active
+            # The loop condition `while True` is fine as receive_json will raise on disconnect.
             message = await websocket.receive_json()
             if message.get("type") == "audio_chunk":
                 audio_b64 = message.get("data")
                 if audio_b64:
                     try:
                         audio_bytes = base64.b64decode(audio_b64)
-                        await manager.process_audio(audio_bytes, ASSISTANT_THREAD_ID, is_local_source=False)
+                        # Ensure manager is still valid and websocket is the current one
+                        if manager and manager.websocket is websocket and manager.is_websocket_active:
+                             await manager.process_audio(audio_bytes, ASSISTANT_THREAD_ID, is_local_source=False)
+                        else:
+                            logger.warning("Received audio_chunk but manager state is inconsistent or websocket changed.")
+                            break # Exit loop if manager state is no longer valid for this socket
                     except (base64.binascii.Error, TypeError) as e:
                         logger.error(f"Invalid base64 audio data: {e}")
-                        if manager.is_websocket_active: await manager.send_error("Invalid audio data.")
+                        if manager and manager.websocket is websocket and manager.is_websocket_active:
+                             await manager.send_error("Invalid audio data.")
                     except Exception as e:
                          logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
-                         if manager.is_websocket_active: await manager.send_error("Server error processing audio.")
+                         if manager and manager.websocket is websocket and manager.is_websocket_active:
+                              await manager.send_error("Server error processing audio.")
+            # Add other message type handlers here if client sends more than audio
+            # e.g., client settings, explicit stop commands, etc.
             
     except WebSocketDisconnect as e:
-        logger.info(f"WebSocket disconnected: code={e.code}, reason='{e.reason}'")
+        logger.info(f"WebSocket disconnected by client: code={e.code}, reason='{e.reason}'")
+        # manager.disconnect will be called in finally
     except Exception as e:
-        logger.error(f"WebSocket Error: {e}", exc_info=True)
-        if manager and manager.is_websocket_active:
-            await manager.send_error(f"Unexpected WebSocket error: {str(e)}")
+        logger.error(f"Unexpected WebSocket Error: {e}", exc_info=True)
+        if manager and manager.websocket is websocket and manager.is_websocket_active:
+            # Try to send an error message before disconnecting
+            try:
+                await manager.send_error(f"Unexpected server-side WebSocket error: {str(e)}")
+            except Exception as send_err:
+                logger.error(f"Failed to send error to client before disconnect: {send_err}")
+        # manager.disconnect will be called in finally
     finally:
-        if manager: await manager.disconnect()
+        # Ensure disconnect is called, passing the websocket that triggered this endpoint
+        if manager and manager.websocket is websocket: # Only disconnect if this is the active websocket
+            logger.info(f"Calling manager.disconnect for websocket {websocket.client}")
+            await manager.disconnect(reason="WebSocket endpoint cleanup")
+        else:
+            logger.info(f"Manager.websocket is no longer {websocket.client} or manager is None; disconnect might have been handled.")
 
 
 if __name__ == "__main__":
@@ -870,27 +876,24 @@ if __name__ == "__main__":
             logger.info(f"\n{sd.query_devices()}")
             logger.info(f"Using Input Device Index: {settings.sounddevice.input_device_index if settings.sounddevice.input_device_index is not None else 'Default'}")
             logger.info(f"Using Output Device Index: {settings.sounddevice.output_device_index if settings.sounddevice.output_device_index is not None else 'Default'}")
-            logger.info(f"SoundDevice TTS Output Sample Rate: {settings.sounddevice.tts_output_sample_rate} Hz")
+            logger.info(f"SoundDevice TTS Output Sample Rate (default): {settings.sounddevice.tts_output_sample_rate} Hz")
         except Exception as e:
             logger.warning(f"Could not list audio devices on startup: {e}")
     
-    # Log Gemini specific info
-    if settings.engines.tts_engine == "hybrid" or settings.engines.tts_engine == "gemini":
-        logger.info(f"Gemini TTS configured with model: {settings.gemini_tts.model}, voice: {settings.gemini_tts.voice_name}")
+    if settings.engines.tts_engine == "hybrid" or settings.engines.tts_engine == "gemini" or \
+       settings.engines.tts_online_provider == "gemini" or settings.engines.tts_offline_provider == "gemini":
+        logger.info(f"Gemini TTS configured with model: {settings.gemini_tts.model}, voice: {settings.gemini_tts.voice_name}, sample_rate: {settings.gemini_tts.sample_rate}Hz")
         if not settings.gemini_tts.api_key:
             logger.warning("GEMINI_API_KEY is not set. Gemini TTS will not function.")
         else:
             logger.info("GEMINI_API_KEY is set.")
 
-    # Log activation sound info
     if settings.audio.play_activation_sound:
-        if settings.audio.activation_sound_path and os.path.exists(settings.audio.activation_sound_path):
+        if settings.audio.activation_sound_path: # Path is resolved and checked in settings
             logger.info(f"Activation sound enabled and file found: {settings.audio.activation_sound_path}")
-        elif settings.audio.activation_sound_path:
-            logger.warning(f"Activation sound enabled but file NOT found: {settings.audio.activation_sound_path}")
         else:
-            logger.warning("Activation sound enabled but ACTIVATION_SOUND_PATH is not set.")
+            logger.warning("Activation sound enabled but ACTIVATION_SOUND_PATH is not set or file not found.")
     else:
         logger.info("Activation sound is disabled.")
 
-    uvicorn.run(app, host=settings.webapp.host, port=settings.webapp.port)
+    uvicorn.run("main:app", host=settings.webapp.host, port=settings.webapp.port, reload=True)
