@@ -39,6 +39,7 @@ from engines.stt.vosk_stt import VoskSTTEngine
 from engines.tts.paroli_tts import ParoliTTSEngine
 from engines.nlu.rasa_nlu import RasaNLUEngine
 from engines.llm_logic.langgraph_llm import LangGraphLLMEngine
+from engines.llm_logic.ollama_llm import OllamaLLMEngine # NEW
 from engines.audio_io.sounddevice_io import SoundDeviceInputEngine, SoundDeviceOutputEngine
 from engines.communication.mqtt_service import MQTTService
 from engines.offline_processing.base import OfflineCommandProcessorBase
@@ -60,6 +61,7 @@ stt_engine: Optional[STTRecognizerProvider] = None # Provides recognizer instanc
 tts_engine: Optional[TTSEngineBase] = None
 nlu_engine: Optional[NLUEngineBase] = None
 llm_logic_engine: Optional[LLMLogicEngineBase] = None
+offline_llm_logic_engine: Optional[LLMLogicEngineBase] = None # For offline logic (e.g., Ollama)
 audio_input_engine: Optional[AudioInputEngineBase] = None
 audio_output_engine: Optional[AudioOutputEngineBase] = None
 comm_service: Optional[CommunicationServiceBase] = None # e.g., MQTT
@@ -104,6 +106,13 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
                     "ai_settings": global_settings.ai,
                     "postgres_settings": global_settings.postgres
                 })
+        elif engine_type == "offline_llm_logic": # This is for the offline LLM
+             if engine_name == "ollama":
+                if global_settings.ollama.base_url and global_settings.ollama.model:
+                    return OllamaLLMEngine(config={"ollama_settings": global_settings.ollama})
+                else:
+                    logger.warning("Ollama engine selected but base_url or model not configured. Skipping.")
+                    return None
         elif engine_type == "audio_input":
             if engine_name == "sounddevice":
                 # Needs callback, loop, and specific configs
@@ -132,7 +141,8 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
     return None
 
 async def initialize_global_engines(app_settings: Settings):
-    global wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine, llm_logic_engine
+    global wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine
+    global llm_logic_engine, offline_llm_logic_engine # Added offline_llm_logic_engine
     global audio_input_engine, audio_output_engine, comm_service, manager
     global offline_command_processor
 
@@ -164,35 +174,35 @@ async def initialize_global_engines(app_settings: Settings):
     stt_engine = create_engine_instance("stt", app_settings.engines.stt_engine, app_settings)
     tts_engine = create_engine_instance("tts", app_settings.engines.tts_engine, app_settings)
     nlu_engine = create_engine_instance("nlu", app_settings.engines.nlu_engine, app_settings)
+    # Online LLM
     llm_logic_engine = create_engine_instance("llm_logic", app_settings.engines.llm_logic_engine, app_settings)
+    # Offline LLM
+    offline_llm_logic_engine = create_engine_instance("offline_llm_logic", app_settings.engines.offline_llm_engine, app_settings)
 
     # Initialize ConnectionManager (needed for audio_input_engine callback)
     # Pass already initialized engines to ConnectionManager
-    if not all([wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine, llm_logic_engine, comm_service]): # comm_service added
-        logger.critical("One or more core processing engines failed to initialize. Functionality will be severely limited.")
-        # Depending on criticality, could raise an error here to stop startup
-    
-        # Ensure offline_command_processor is initialized before being passed
-    if not offline_command_processor and comm_service: # Check if it needs to be initialized
-        logger.warning("offline_command_processor was not initialized prior to ConnectionManager, attempting now.")
-        offline_command_processor = DefaultOfflineCommandProcessor(comm_service=comm_service)
-        # This might be redundant if already initialized earlier as planned.
-
+    # Check primary engines; offline LLM is optional.
+    if not all([wake_word_engine, vad_engine, stt_engine, tts_engine, nlu_engine, comm_service]): 
+        logger.critical("One or more core processing or communication engines failed to initialize. Functionality will be severely limited.")
+    if not llm_logic_engine:
+        logger.warning("Online LLM logic engine failed to initialize. Online general queries will not work.")
+    if not offline_llm_logic_engine:
+        logger.warning("Offline LLM logic engine failed to initialize. Offline general queries will not work.")
     if not offline_command_processor:
-        logger.error("Offline command processor is not available. Offline commands will fail.")
-        # Decide if this is a critical failure. For now, let it proceed but offline will be broken.
+        logger.warning("Offline command processor is not available. Offline commands might not work as expected.")
     
     manager = ConnectionManager(
         wake_word_engine=wake_word_engine,
         vad_engine=vad_engine,
-        stt_provider=stt_engine, # Renamed for clarity
+        stt_provider=stt_engine, 
         tts_engine=tts_engine,
         nlu_engine=nlu_engine,
-        llm_logic_engine=llm_logic_engine,
+        llm_logic_engine=llm_logic_engine, # Online LLM
+        offline_llm_logic_engine=offline_llm_logic_engine, # Offline LLM
         comm_service=comm_service,
-        offline_processor=offline_command_processor, # Pass communication service
-        global_audio_settings=app_settings.audio, # Pass global audio settings
-        vad_processing_settings=app_settings.vad_config # Pass VAD processing settings
+        offline_processor=offline_command_processor,
+        global_audio_settings=app_settings.audio,
+        vad_processing_settings=app_settings.vad_config
     )
     logger.info("ConnectionManager initialized.")
 
@@ -243,9 +253,9 @@ async def initialize_global_engines(app_settings: Settings):
 async def shutdown_global_engines():
     logger.info("Shutting down global engines...")
     engine_list = [
-        tts_engine, llm_logic_engine, comm_service, # Services with servers/connections first
-        wake_word_engine, vad_engine, stt_engine, nlu_engine, # Processing libraries
-        audio_input_engine, audio_output_engine # Local I/O last
+        tts_engine, llm_logic_engine, offline_llm_logic_engine, comm_service, nlu_engine,
+        wake_word_engine, vad_engine, stt_engine, 
+        audio_input_engine, audio_output_engine 
     ]
     for engine in engine_list:
         if engine and hasattr(engine, "shutdown"):
@@ -320,13 +330,14 @@ async def get_root():
 
 
 class ConnectionManager:
-    def __init__(self, wake_word_engine: WakeWordEngineBase,
-                 vad_engine: VADEngineBase,
-                 stt_provider: STTRecognizerProvider, # Provides recognizer instances
-                 tts_engine: TTSEngineBase,
-                 nlu_engine: NLUEngineBase,
-                 llm_logic_engine: LLMLogicEngineBase,
-                 comm_service: CommunicationServiceBase,
+    def __init__(self, wake_word_engine: Optional[WakeWordEngineBase],
+                 vad_engine: Optional[VADEngineBase],
+                 stt_provider: Optional[STTRecognizerProvider],
+                 tts_engine: Optional[TTSEngineBase],
+                 nlu_engine: Optional[NLUEngineBase],
+                 llm_logic_engine: Optional[LLMLogicEngineBase], # Online
+                 offline_llm_logic_engine: Optional[LLMLogicEngineBase], # Offline
+                 comm_service: Optional[CommunicationServiceBase],
                  offline_processor: Optional[OfflineCommandProcessorBase],
                  global_audio_settings: "AudioSettings", # type: ignore
                  vad_processing_settings: "VADSettings"): # type: ignore
@@ -337,9 +348,10 @@ class ConnectionManager:
         self.tts_engine = tts_engine
         self.nlu_engine = nlu_engine
         self.llm_logic_engine = llm_logic_engine
-        self.comm_service = comm_service # For device list, actions
-        self.offline_processor = offline_processor # Store it
-        self._last_mentioned_device_for_pronoun: Optional[str] = None # Context for pronouns
+        self.offline_llm_logic_engine = offline_llm_logic_engine # Store it
+        self.comm_service = comm_service 
+        self.offline_processor = offline_processor 
+        self._last_mentioned_device_for_pronoun: Optional[str] = None 
         self.global_audio_settings = global_audio_settings
         self.vad_processing_settings = vad_processing_settings
 
@@ -352,31 +364,28 @@ class ConnectionManager:
         self.llm_tts_task: Optional[asyncio.Task] = None
         self.is_websocket_active: bool = False
         
-        self.local_audio_output_engine: Optional[AudioOutputEngineBase] = None # Set via set_local_audio_output
+        self.local_audio_output_engine: Optional[AudioOutputEngineBase] = None
 
-        # Validate engine compatibility (example)
         if self.wake_word_engine and self.global_audio_settings.frame_length != self.wake_word_engine.frame_length:
             logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) "
                            f"differs from WakeWord frame length ({self.wake_word_engine.frame_length}). Ensure input matches WW.")
         if self.vad_engine and self.global_audio_settings.frame_length != self.vad_engine.frame_length:
             logger.warning(f"Global audio frame length ({self.global_audio_settings.frame_length}) "
                            f"differs from VAD frame length ({self.vad_engine.frame_length}).")
-        # STT engine sample rate is configured during its init. ConnectionManager uses global audio settings for chunking.
         if self.stt_provider:
             try:
                 self.stt_recognizer = self.stt_provider.create_recognizer()
                 logger.info("ConnectionManager: STT recognizer instance created during init.")
             except Exception as e:
                 logger.error(f"ConnectionManager: Failed to create STT recognizer during init: {e}", exc_info=True)
-                # self.stt_recognizer will remain None, process_audio will catch this.
         else:
-            logger.warning("ConnectionManager: STT provider not available during init. STT will not work until reconfigured or WebSocket connects.")
+            logger.warning("ConnectionManager: STT provider not available during init. STT will not work.")
 
     def set_local_audio_output(self, local_audio_out_engine: AudioOutputEngineBase):
         self.local_audio_output_engine = local_audio_out_engine
 
     async def connect(self, websocket: WebSocket):
-        global audio_input_engine, audio_output_engine # Access global instances
+        global audio_input_engine, audio_output_engine 
         if self.websocket is not None and self.websocket.client_state == WebSocketState.CONNECTED:
             await websocket.accept()
             await websocket.close(code=1008, reason="Server busy")
@@ -394,10 +403,9 @@ class ConnectionManager:
         if audio_input_engine and audio_input_engine.is_enabled:
             logger.info("WebSocket connected, pausing local audio input.")
             audio_input_engine.pause()
-        if audio_output_engine and audio_output_engine.is_enabled: # Also stop any local TTS
+        if audio_output_engine and audio_output_engine.is_enabled: 
             logger.info("WebSocket connected, stopping any local audio output.")
-            audio_output_engine.stop() # Stop playback
-            # Output worker might need to be restarted on disconnect if we want local TTS after WS.
+            audio_output_engine.stop() 
 
         if not self.stt_provider:
             logger.error("STT provider not available!")
@@ -406,10 +414,10 @@ class ConnectionManager:
             return False
         
         try:
-            if not self.stt_recognizer: # Create if first time
+            if not self.stt_recognizer: 
                 self.stt_recognizer = self.stt_provider.create_recognizer()
                 logger.info("STT recognizer created.")
-            else: # Reset if exists
+            else: 
                 self.stt_recognizer.reset()
                 logger.info("STT recognizer reset.")
         except Exception as e:
@@ -423,8 +431,8 @@ class ConnectionManager:
         return True
 
     async def disconnect(self, code: int = 1000, reason: str = "Client disconnected"):
-        global audio_input_engine, audio_output_engine # Access global instances
-        self.is_websocket_active = False # Mark inactive first
+        global audio_input_engine, audio_output_engine 
+        self.is_websocket_active = False 
 
         if self.llm_tts_task and not self.llm_tts_task.done():
             self.llm_tts_task.cancel()
@@ -440,20 +448,17 @@ class ConnectionManager:
                 try: await ws.close(code=code, reason=reason)
                 except Exception as e: logger.warning(f"Error closing WebSocket: {e}")
         
-        self.state = "disconnected" # General state
-        # Don't delete stt_recognizer, just reset on next connect.
+        self.state = "disconnected" 
 
         logger.info("WebSocket client disconnected.")
 
-        # Resume local audio if enabled
         if audio_input_engine and audio_input_engine.is_enabled:
             logger.info("WebSocket disconnected, resuming local audio input.")
             if not audio_input_engine.is_running: audio_input_engine.start()
             audio_input_engine.resume()
-            self.state = "wakeword" # Set state for local audio
+            self.state = "wakeword" 
             logger.info("Local audio interface active, waiting for wake word.")
         if audio_output_engine and audio_output_engine.is_enabled:
-            # Ensure local output is ready for potential TTS from local interaction
             if not audio_output_engine.is_running: audio_output_engine.start()
 
 
@@ -485,109 +490,7 @@ class ConnectionManager:
         logger.error(f"Sending error to client: {error_message}")
         if self.is_websocket_active:
             await self._send_json({"type": "error", "message": error_message})
-
-    async def _handle_offline_command(self, nlu_result: Dict[str, Any]) -> str:
-        """ Executes command parsed by NLU engine. """
-        # This logic was previously in offline_controller.execute_offline_command
-        # It needs access to tools or communication service.
-        intent = nlu_result.get("intent")
-        response_text = f"Sorry, I couldn't handle the offline command for intent '{intent}'."
-
-        if not self.comm_service: # Check if comm_service is available
-            logger.error("Communication service not available to execute offline command.")
-            return "Offline device control is currently unavailable."
-
-        if intent == "get_time":
-            from tools.time import get_current_time # Tool import
-            timezone_arg = nlu_result.get("timezone_str_for_tool")
-            try:
-                response_text = get_current_time.invoke({"timezone_str": timezone_arg})
-            except Exception as e:
-                logger.error(f"Error calling get_current_time tool: {e}", exc_info=True)
-                response_text = "Error getting time."
-        
-        elif intent in ["activate_device", "deactivate_device", "set_attribute"]:
-            from tools.device_control import set_device_attribute # Tool import
-            
-            # Resolve device using NLU output and comm_service
-            # The new NLU output gives "device_description_text" and "device_is_pronoun"
-            device_desc = nlu_result.get("device_description_text")
-            is_pronoun = nlu_result.get("device_is_pronoun", False)
-            
-            # Context for last mentioned device needs to be managed by ConnectionManager
-            # For now, we'll use the NLU's context as a proxy if it was updated.
-            # A more robust solution would be ConnectionManager maintaining this context.
-            if is_pronoun and hasattr(self.nlu_engine, '_last_mentioned_device_context'):
-                # This is a hacky way to access context, ideally NLU shouldn't hold state like this
-                # or ConnectionManager should manage it.
-                device_desc = self.nlu_engine._last_mentioned_device_context.get("value", device_desc)
-
-            if not device_desc:
-                return "I'm not sure which device you mean."
-
-            # Use the set_device_attribute tool (which itself uses comm_service)
-            # The tool needs the comm_service instance. This is a bit indirect.
-            # The tool should be configured with comm_service when LangGraph is set up.
-            # Here, we are calling it directly for offline mode.
-            # This means tools used offline must be callable directly.
-            
-            # Update: tools.device_control.set_device_attribute is now a Langchain tool.
-            # It uses the global `mqtt_client` which is now `comm_service`.
-            # We need to ensure tools can access the `comm_service` instance.
-            # This is a gap: Langchain tools are typically stateless or configured at init.
-            # A quick fix: modify tools to accept `comm_service` if passed, else use global.
-            # Or, the tool itself should be an object that gets comm_service at init.
-            # For now, let's assume set_device_attribute can be called and will find comm_service.
-            # This might require tools to be refactored slightly if they relied on the old global mqtt_client.
-            # Let's assume `tools.set_device_attribute` is refactored to be a simple function for now for offline use.
-            
-            # Simplified call to a hypothetical direct function:
-            # result_message = await direct_set_device_attribute(
-            #     comm_service=self.comm_service,
-            #     user_description=device_desc, # NLU now gives description
-            #     attribute=nlu_result.get("attribute"),
-            #     value=str(nlu_result.get("raw_value"))
-            # )
-            # response_text = result_message
-
-            # For now, let's call the Langchain tool's underlying function if possible,
-            # or simulate its action. This part is tricky because tools are integrated with LangGraph.
-            # The original `execute_offline_command` called the tool directly.
-            # Let's replicate that, assuming `set_device_attribute` can be invoked.
-            # The tool needs to be adapted to use the passed `comm_service`.
-            # This is a larger refactor of tools. For now, mock this part:
-            
-            # Mocking the tool call for now due to complexity of tool DI here:
-            if hasattr(self.comm_service, 'publish'): # A crude check for MQTT-like service
-                attr = nlu_result.get("attribute")
-                val = str(nlu_result.get("raw_value"))
-                # This is a placeholder for the actual device control logic.
-                # The original `set_device_attribute` tool would handle MQTT interaction.
-                # We need a way for offline commands to use these tools.
-                # Tools need to be designed to be usable by both LLM and direct calls.
-                
-                # Find the actual device name using comm_service
-                resolved_device_name = None
-                available_devices = self.comm_service.get_device_friendly_names()
-                if available_devices:
-                    from offline_controller import find_best_match as fbm # temp import
-                    resolved_device_name = fbm(device_desc, available_devices, score_cutoff=70)
-                
-                if resolved_device_name and attr and val is not None:
-                    logger.info(f"Offline attempt: Control {resolved_device_name}, {attr}={val}")
-                    # Here you would call a function that uses self.comm_service
-                    # e.g., from tools.device_control import _control_device_actual
-                    # await _control_device_actual(self.comm_service, resolved_device_name, attr, val)
-                    response_text = f"Okay, I've set {attr} of {resolved_device_name} to {val} (simulated for offline)."
-                else:
-                    response_text = f"I understood you want to control '{device_desc}' for '{attr}', but couldn't fully process it offline."
-            else:
-                response_text = "Device control is not available for this communication service."
-
-
-        return response_text
-
-
+    
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
         response_text = ""
         tts_audio_bytes_for_local = bytearray()
@@ -600,36 +503,48 @@ class ConnectionManager:
             self.state = "processing"
 
             online = await is_internet_available()
-            use_online_logic = online and settings.ai.online_mode # Use global settings for this check
+            # Determine if online processing should be attempted
+            attempt_online_processing = online and settings.ai.online_mode and self.llm_logic_engine
 
-            if use_online_logic and self.llm_logic_engine:
-                logger.info("Using online LLM.")
-                lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id)
-                response_text = lumi_response if lumi_response else "Sorry, I didn't get a response."
-            elif self.nlu_engine and self.offline_processor:
-                logger.info("Using offline NLU and Processor.")
-                nlu_result = await self.nlu_engine.parse(text) # Gets dict from RasaNLUEngine
-                
-                if nlu_result and nlu_result.get("intent"):
-                    logger.info(f"Offline NLU result: {nlu_result}")
-                    
-                    resolved_command = await self.offline_processor.process_nlu_result(
-                        nlu_result,
-                        self._last_mentioned_device_for_pronoun # Pass current context
-                    )
-                    
-                    response_text = await self.offline_processor.execute_resolved_command(resolved_command)
+            if attempt_online_processing:
+                logger.info("Using online LLM (LangGraph).")
+                lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
+                response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                if not response_text: response_text = "Sorry, I didn't get a response from the online assistant."
 
-                    # Update pronoun context if device was successfully identified
-                    # The processor now includes 'resolved_device_name_for_context_update'
-                    if resolved_command.get("executable") and \
-                       resolved_command.get("resolved_device_name_for_context_update"):
-                        self._last_mentioned_device_for_pronoun = resolved_command["resolved_device_name_for_context_update"]
-                        logger.debug(f"ConnectionManager: Updated pronoun context to '{self._last_mentioned_device_for_pronoun}'")
-                else:
-                    response_text = "Sorry, I couldn't understand that command offline."
+            else: # Offline processing path
+                logger.info("Offline processing path activated.")
+                nlu_result = None
+                if self.nlu_engine:
+                    logger.debug("Attempting NLU parse for potential offline command.")
+                    nlu_result = await self.nlu_engine.parse(text)
 
-
+                if nlu_result and nlu_result.get("intent"): # NLU found a command
+                    if self.offline_processor:
+                        logger.info(f"Offline NLU parsed command: {nlu_result}")
+                        resolved_command = await self.offline_processor.process_nlu_result(
+                            nlu_result, self._last_mentioned_device_for_pronoun
+                        )
+                        response_text = await self.offline_processor.execute_resolved_command(resolved_command)
+                        
+                        if resolved_command.get("executable") and \
+                           resolved_command.get("resolved_device_name_for_context_update"):
+                            self._last_mentioned_device_for_pronoun = resolved_command["resolved_device_name_for_context_update"]
+                            logger.debug(f"ConnectionManager: Updated pronoun context to '{self._last_mentioned_device_for_pronoun}'")
+                    else: # NLU found command, but no processor
+                        logger.warning("Offline NLU parsed a command, but no offline_processor is available.")
+                        response_text = "I understood an offline command, but cannot process it right now."
+                else: # NLU did not find a command (or NLU unavailable/failed) -> try offline LLM
+                    if self.offline_llm_logic_engine:
+                        logger.info("NLU did not identify a command / NLU unavailable. Trying offline LLM (Ollama).")
+                        lumi_response = await self.offline_llm_logic_engine.ask(text, thread_id=thread_id)
+                        response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                        if not response_text: response_text = "The offline assistant didn't provide a response."
+                    else: # No NLU command AND no offline LLM
+                        logger.info("NLU did not identify a command, and offline LLM is not available.")
+                        response_text = "I can only process specific commands offline, and this wasn't one of them. The general offline assistant is also unavailable."
+            
+            # TTS Synthesis
             if response_text and self.tts_engine:
                 if self.is_websocket_active:
                     await self.send_status("speaking_started", "Speaking...")
@@ -643,27 +558,30 @@ class ConnectionManager:
                     if self.local_audio_output_engine and self.local_audio_output_engine.is_enabled:
                         tts_audio_bytes_for_local.extend(tts_chunk)
                 
-                if self.is_websocket_active:
-                    await self.send_tts_finished()
+                if self.is_websocket_active: await self.send_tts_finished()
                 
                 if tts_audio_bytes_for_local and self.local_audio_output_engine and \
                    self.local_audio_output_engine.is_enabled and not self.is_websocket_active:
                     logger.info(f"Queueing {len(tts_audio_bytes_for_local)} bytes for local TTS.")
-                    # Ensure local audio output is running
                     if not self.local_audio_output_engine.is_running:
                          self.local_audio_output_engine.start()
                     self.local_audio_output_engine.play_tts_bytes(bytes(tts_audio_bytes_for_local))
             
             elif not response_text:
-                logger.warning("No response text generated.")
+                logger.warning("No response text generated by any LLM/NLU path.")
+                # Potentially send a generic "I don't know" if WS is active
+                if self.is_websocket_active:
+                    await self.send_error("Sorry, I could not process your request.")
+
 
         except asyncio.CancelledError:
             logger.info("LLM/TTS/Offline background task cancelled.")
         except Exception as e:
             logger.error(f"Error in _run_llm_tts_or_offline: {e}", exc_info=True)
-            await self.send_error(f"Error processing request: {str(e)}") # Sends only if WS active
+            if self.is_websocket_active: # Send error only if WS active
+                await self.send_error(f"Error processing request: {str(e)}")
         finally:
-            if self.state != "disconnected": # Don't change state if already disconnected
+            if self.state != "disconnected": 
                 self.state = "wakeword"
                 if self.is_websocket_active:
                     await self.send_status("wakeword_listening", "Waiting for wake word...")

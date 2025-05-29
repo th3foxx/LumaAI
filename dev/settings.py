@@ -26,6 +26,7 @@ class EngineSelectorSettings:
     tts_engine: str = os.getenv("TTS_ENGINE", "paroli") # e.g., "paroli"
     nlu_engine: str = os.getenv("NLU_ENGINE", "rasa")   # e.g., "rasa"
     llm_logic_engine: str = os.getenv("LLM_LOGIC_ENGINE", "langgraph") # e.g., "langgraph"
+    offline_llm_engine: str = os.getenv("OFFLINE_LLM_ENGINE", "ollama") # e.g., "ollama" for offline
     audio_input_engine: str = os.getenv("AUDIO_INPUT_ENGINE", "sounddevice")
     audio_output_engine: str = os.getenv("AUDIO_OUTPUT_ENGINE", "sounddevice")
     communication_engine: str = os.getenv("COMMUNICATION_ENGINE", "mqtt")
@@ -111,7 +112,7 @@ class PostgresSettings:
 
 
 @dataclass(frozen=True)
-class AISettings: # For LLM/LangGraph
+class AISettings: # For LLM/LangGraph (Online)
     embedding_model: str = os.getenv("EMBED_MODEL", "google_vertexai:text-multilingual-embedding-002")
     embedding_dims: int = int(os.getenv("EMBED_DIMS", 768))
     grok_model: str = os.getenv("GROK_MODEL", "grok-2-1212") # This is specific to the LangGraphLLM
@@ -120,6 +121,14 @@ class AISettings: # For LLM/LangGraph
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = 10
     online_mode: bool = os.getenv("AI_ONLINE_MODE", "True").lower() in ("true", "1", "t")
+
+
+@dataclass(frozen=True)
+class OllamaSettings: # For Offline LLM
+    base_url: Optional[str] = os.getenv("OLLAMA_BASE_URL", "http://localhost:8082")
+    model: Optional[str] = os.getenv("OLLAMA_MODEL", "qwen:1b") # Or your preferred model
+    temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", 0.8))
+    system_prompt: Optional[str] = os.getenv("OLLAMA_SYSTEM_PROMPT", "You are a helpful offline assistant.")
 
 
 @dataclass(frozen=True)
@@ -230,6 +239,7 @@ class Settings:
     webapp: WebAppSettings = field(default_factory=WebAppSettings)
     postgres: PostgresSettings = field(default_factory=PostgresSettings)
     ai: AISettings = field(default_factory=AISettings) # For LLM
+    ollama: OllamaSettings = field(default_factory=OllamaSettings) # For Offline LLM
     mqtt_broker: MqttBrokerSettings = field(default_factory=MqttBrokerSettings)
     rasa_nlu: RasaNLUSettings = field(default_factory=RasaNLUSettings)
     sounddevice: SoundDeviceSettings = field(default_factory=SoundDeviceSettings)
