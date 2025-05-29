@@ -14,7 +14,8 @@ from starlette.websockets import WebSocketState
 
 # Project specific imports
 from settings import settings, Settings, AudioSettings # Import the main Settings class and AudioSettings for type hint
-from connectivity import is_internet_available
+# MODIFIED: Import new functions from connectivity
+from connectivity import is_internet_available, start_connectivity_monitoring, stop_connectivity_monitoring 
 
 from tools.scheduler import init_db as init_scheduler_db
 from utils.music_db import init_music_likes_table
@@ -261,6 +262,7 @@ async def shutdown_global_engines():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase beginning...")
+    await start_connectivity_monitoring() # MODIFIED
     try:
         init_scheduler_db()
         init_music_likes_table()
@@ -291,6 +293,7 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan: Shutdown phase beginning...")
     await stop_reminder_checker()
     await shutdown_global_engines()
+    await stop_connectivity_monitoring() # MODIFIED
     logger.info("Lifespan: Shutdown phase complete.")
 
 
@@ -537,10 +540,10 @@ class ConnectionManager:
             await self._send_json({"type": "error", "message": error_message})
     
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
-            response_text = ""
+            response_text = "" # Initialize response_text
             tts_audio_bytes_for_local = bytearray()
-            current_tts_sample_rate_for_playback = None # Unified for local and WS
-            
+            current_tts_sample_rate_for_playback = None 
+
             try:
                 if self.is_websocket_active:
                     await self.send_status("processing_started", "Thinking...")
@@ -549,15 +552,42 @@ class ConnectionManager:
                 self.state = "processing"
 
                 online_capable = await is_internet_available()
-                attempt_online_processing = online_capable and settings.ai.online_mode and self.llm_logic_engine
+                # Determine if an online LLM attempt should be made
+                attempt_online_llm = online_capable and settings.ai.online_mode and self.llm_logic_engine
+                
+                online_llm_attempt_made = False
+                online_llm_succeeded = False
 
-                if attempt_online_processing:
+                if attempt_online_llm:
+                    online_llm_attempt_made = True
                     logger.info("Using online LLM (LangGraph).")
-                    lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
-                    response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
-                    if not response_text: response_text = "Sorry, I didn't get a response from the online assistant."
-                else:
-                    logger.info(f"Offline processing path activated (Internet: {online_capable}, Online Mode: {settings.ai.online_mode}).")
+                    try:
+                        lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
+                        _candidate_response = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                        
+                        # Check if the response is not empty and not a generic error message from the LLM itself
+                        # Error messages from LangGraphLLM.ask start with "Sorry, an error occurred" or "Sorry, the language model is not available"
+                        if _candidate_response and not (
+                            _candidate_response.startswith("Sorry, an error occurred") or \
+                            _candidate_response.startswith("Sorry, the language model is not available")
+                            ):
+                            response_text = _candidate_response
+                            online_llm_succeeded = True
+                            logger.info("Online LLM successfully provided a response.")
+                        else:
+                            logger.warning(f"Online LLM returned an empty or error-like response: '{_candidate_response}'. Will fall back to offline.")
+                            # response_text remains empty, online_llm_succeeded is false
+                    except Exception as e:
+                        logger.error(f"Exception during online LLM call: {e}. Will fall back to offline.", exc_info=True)
+                        # response_text remains empty, online_llm_succeeded is false
+                
+                # If online processing was not attempted, or if it was attempted but did not succeed
+                if not online_llm_succeeded:
+                    if online_llm_attempt_made:
+                        logger.info("Online LLM attempt did not yield a usable response. Proceeding with offline processing.")
+                    else: # Online LLM was not attempted
+                        logger.info(f"Offline processing path activated (Online LLM not attempted. Internet: {online_capable}, Online Mode: {settings.ai.online_mode}).")
+
                     nlu_result = None
                     if self.nlu_engine:
                         logger.debug("Attempting NLU parse for potential offline command.")
@@ -577,28 +607,48 @@ class ConnectionManager:
                         else:
                             logger.warning("Offline NLU parsed a command, but no offline_processor is available.")
                             response_text = "I understood an offline command, but cannot process it right now."
-                    else:
+                    else: # NLU did not identify a command / NLU unavailable
                         if self.offline_llm_logic_engine:
                             logger.info("NLU did not identify a command / NLU unavailable. Trying offline LLM (Ollama).")
-                            lumi_response = await self.offline_llm_logic_engine.ask(text, thread_id=thread_id)
-                            response_text = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
-                            if not response_text: response_text = "The offline assistant didn't provide a response."
-                        else:
+                            lumi_response_offline = await self.offline_llm_logic_engine.ask(text, thread_id=thread_id)
+                            _candidate_offline_response = lumi_response_offline if isinstance(lumi_response_offline, str) else lumi_response_offline.content # type: ignore
+                            
+                            # Check if offline LLM response is not empty and not its own generic error
+                            # Error messages from OllamaLLMEngine.ask start with "Sorry, an error occurred" or "Sorry, the offline language model is not available"
+                            if _candidate_offline_response and not (
+                                _candidate_offline_response.startswith("Sorry, an error occurred") or \
+                                _candidate_offline_response.startswith("Sorry, the offline language model is not available")
+                                ):
+                                response_text = _candidate_offline_response
+                            else:
+                                logger.warning(f"Offline LLM also returned an empty or error-like response: '{_candidate_offline_response}'")
+                                if not response_text: # Ensure we set a message if it's still empty after this path
+                                     response_text = "The offline assistant didn't provide a response."
+                        else: # No NLU match, and no offline LLM
                             logger.info("NLU did not identify a command, and offline LLM is not available.")
-                            response_text = "I can only process specific commands offline, and this wasn't one of them. The general offline assistant is also unavailable."
+                            if not response_text: # Ensure we set a message if it's still empty
+                                if online_llm_attempt_made : # Online was tried and failed, now offline options also exhausted
+                                    response_text = "I couldn't process this online, and no suitable offline action was found."
+                                else: # Online was not even an option, and offline options exhausted
+                                    response_text = "I can only process specific commands offline, and this wasn't one of them. The general offline assistant is also unavailable."
                 
+                # Final fallback if response_text is STILL empty after all attempts (should be rare)
+                if not response_text:
+                    logger.error("All processing paths (online, NLU, offline LLM) failed to produce a response_text.")
+                    response_text = "I'm sorry, I was unable to process your request at this time."
+                
+                # --- TTS Section ---
                 if response_text and self.tts_engine:
                     active_tts_synthesizer = None
                     if isinstance(self.tts_engine, HybridTTSEngine):
                         active_tts_synthesizer = await self.tts_engine.get_active_engine_for_synthesis()
-                    elif hasattr(self.tts_engine, 'get_output_sample_rate'): # Check if it's a standalone engine
+                    elif hasattr(self.tts_engine, 'get_output_sample_rate'): 
                         active_tts_synthesizer = self.tts_engine
                     
                     if active_tts_synthesizer and await active_tts_synthesizer.is_healthy():
                         current_tts_sample_rate_for_playback = active_tts_synthesizer.get_output_sample_rate()
                         logger.info(f"TTS: Using {active_tts_synthesizer.__class__.__name__} with SR {current_tts_sample_rate_for_playback}Hz.")
 
-                        # Send TTS info to WebSocket client
                         if self.is_websocket_active and current_tts_sample_rate_for_playback:
                             await self.send_tts_info(sample_rate=current_tts_sample_rate_for_playback)
 
@@ -626,9 +676,11 @@ class ConnectionManager:
                     else:
                         logger.error("TTS: No active and healthy synthesizer found or TTS engine is not correctly configured.")
                         if self.is_websocket_active: await self.send_error("Sorry, I can't speak right now (TTS synth error).")
+                        # If TTS fails, response_text still holds the text, but it won't be spoken.
+                        # This is acceptable; the user might see it if there's a UI.
 
-                elif not response_text:
-                    logger.warning("No response text generated by any LLM/NLU path.")
+                elif not response_text: # Should be caught by the final fallback above, but as a safeguard
+                    logger.warning("No response text generated by any LLM/NLU path after all fallbacks.")
                     if self.is_websocket_active:
                         await self.send_error("Sorry, I could not process your request.")
                 elif not self.tts_engine:
@@ -640,10 +692,10 @@ class ConnectionManager:
                 logger.info("LLM/TTS/Offline background task cancelled.")
             except Exception as e:
                 logger.error(f"Error in _run_llm_tts_or_offline: {e}", exc_info=True)
-                if self.is_websocket_active: # Check before sending
+                if self.is_websocket_active: 
                     await self.send_error(f"Error processing request: {str(e)}")
             finally:
-                if self.state != "disconnected": # Ensure we don't revert state if already disconnected
+                if self.state != "disconnected": 
                     self.state = "wakeword"
                     if self.is_websocket_active:
                         await self.send_status("wakeword_listening", "Waiting for wake word...")
