@@ -51,7 +51,7 @@ class VADSettings:
     probability_threshold: float = float(os.getenv("VAD_PROBABILITY_THRESHOLD", 0.6))
     silence_frames_threshold: int = int(os.getenv("VAD_SILENCE_FRAMES_THRESHOLD", 60)) # Renamed for clarity
     min_listening_frames: int = int(os.getenv("VAD_MIN_LISTENING_FRAMES", 30))
-    max_listening_frames: int = int(os.getenv("VAD_MAX_LISTENING_FRAMES", 600))
+    max_listening_frames: int = int(os.getenv("VAD_MAX_LISTENING_FRAMES", 300))
 
     # Новые параметры для адаптивного VAD и "залипания"
     dynamic_threshold_enabled: bool = os.getenv("VAD_DYNAMIC_THRESHOLD_ENABLED", "True").lower() in ("true", "1", "t")

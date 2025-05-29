@@ -46,12 +46,12 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             "executable": False,
             "intent": intent,
             "nlu_raw_output": nlu_result, # Store the raw NLU output for debugging/potential use
-            "response_on_failure": "Sorry, I couldn't fully understand or process that offline."
+            "response_on_failure": "Простите, я не смогла полностью понять или обработать вашу команду в оффлайн режиме."
             # "resolved_device_name_for_context_update": None # Will be set if device is resolved
         }
 
         if not intent:
-            resolved_command["response_on_failure"] = "I didn't understand the intent of your command."
+            resolved_command["response_on_failure"] = "Простите, я не поняла, что вы хотите сделать."
             return resolved_command
 
         # --- GET_TIME INTENT ---
@@ -80,7 +80,7 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             available_devices = self.comm_service.get_device_friendly_names()
 
             if not available_devices:
-                resolved_command["response_on_failure"] = "I can't see any devices to control right now."
+                resolved_command["response_on_failure"] = "Я не вижу доступных устройств для управления."
                 return resolved_command
 
             # Determine the text to use for fuzzy matching
@@ -111,8 +111,8 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             
             if not resolved_device_name:
                 original_search_ref = device_description_from_nlu or \
-                                      (last_mentioned_device_context if is_pronoun or not device_description_from_nlu else "an unspecified device")
-                resolved_command["response_on_failure"] = f"I'm not sure which device you mean based on '{original_search_ref}'."
+                                      (last_mentioned_device_context if is_pronoun or not device_description_from_nlu else "не указанное устройство")
+                resolved_command["response_on_failure"] = f"Я не уверена, какое устройство вы имеете в виду, говоря '{original_search_ref}'."
                 return resolved_command
 
             # Attribute and Value are already processed by RasaNLUEngine
@@ -120,10 +120,10 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             raw_value_from_nlu = nlu_result.get("raw_value") # Already normalized by NLU engine
 
             if not attribute_name: # Should be set by NLU for these intents
-                resolved_command["response_on_failure"] = f"I understood the device '{resolved_device_name}', but not what to change."
+                resolved_command["response_on_failure"] = f"Я поняла, что речь о устройстве '{resolved_device_name}', но не поняла, что именно нужно изменить."
                 return resolved_command
             if raw_value_from_nlu is None and intent == "set_attribute": # Value needed for set_attribute
-                resolved_command["response_on_failure"] = f"For '{resolved_device_name}', I need a value to set for '{attribute_name}'."
+                resolved_command["response_on_failure"] = f"Для устройства '{resolved_device_name}', мне нужно знать, какое значение установить для '{attribute_name}'."
                 return resolved_command
 
             resolved_command.update({
@@ -141,13 +141,13 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             })
             return resolved_command
         else:
-            resolved_command["response_on_failure"] = f"I don't know how to handle the offline intent: {intent}."
+            resolved_command["response_on_failure"] = f"Я пока не умею обрабатывать команду '{intent}' в оффлайн режиме."
             return resolved_command
 
     async def execute_resolved_command(self, resolved_command: Dict[str, Any]) -> str:
         # ... (this method remains largely the same as previously defined) ...
         if not resolved_command.get("executable"):
-            return resolved_command.get("response_on_failure", "Command could not be executed.")
+            return resolved_command.get("response_on_failure", "Команду не удалось выполнить.")
 
         tool_to_call = resolved_command.get("tool_to_call")
         tool_args = resolved_command.get("tool_args", {})
@@ -164,7 +164,7 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
                 )
             else:
                 logger.warning(f"Offline Processor: Unknown tool_to_call '{tool_to_call}'")
-                return f"I don't know how to execute the action: {tool_to_call}."
+                return f"Простите, я не могу выполнить это действие: {tool_to_call}."
         except Exception as e:
             logger.error(f"Offline Processor: Error executing {tool_to_call}: {e}", exc_info=True)
-            return f"Sorry, an error occurred while trying to perform the action."
+            return f"Простите, произошла ошибка при попытке выполнить действие."

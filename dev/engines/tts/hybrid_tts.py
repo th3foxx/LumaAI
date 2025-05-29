@@ -4,6 +4,7 @@ from typing import AsyncIterator, Dict, Any, Optional
 
 from .base import TTSEngineBase
 from connectivity import is_internet_available 
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class HybridTTSEngine(TTSEngineBase):
         internet connectivity and engine health.
         Returns the chosen engine instance, or None if no suitable engine is found.
         """
-        internet_ok = await is_internet_available()
+        internet_ok = await is_internet_available() and settings.ai.online_mode
         
         if self.online_engine and internet_ok:
             if await self.online_engine.is_healthy():

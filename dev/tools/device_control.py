@@ -69,17 +69,17 @@ async def _set_device_attribute_core_logic( # NEW ASYNC HELPER FUNCTION
     """
     if comm_service is None: # Check the passed instance
         logger.error("Core device control logic: communication service is None.")
-        return "Error: Device control service is not configured internally."
+        return "Простите, я не могу управлять устройствами, сервис управления не настроен."
     
     if not comm_service.is_connected:
-        return "Error: Not connected to the device control system."
+        return "Простите, нет подключения к системе управления устройствами."
 
     if not user_description or not attribute or value is None:
-        return "Error: Missing required parameters for device control."
+        return "Простите, мне не хватает информации, чтобы управлять устройством. Пожалуйста, уточните команду."
 
     available_devices = comm_service.get_device_friendly_names()
     if not available_devices:
-        return "Sorry, the device list is unavailable from the control system."
+        return "Простите, список устройств недоступен в системе управления."
 
     # --- 1. Find target device ---
     target_device_name = None
@@ -112,43 +112,44 @@ async def _set_device_attribute_core_logic( # NEW ASYNC HELPER FUNCTION
             target_device_name = best_desc_match[0]
             logger.info(f"Target device by user_description '{user_description}': '{target_device_name}' score {best_desc_match[1]}")
         else:
-            err_msg = f"Sorry, I couldn't find a device matching '{user_description}'."
-            if best_desc_match: err_msg += f" Closest was '{best_desc_match[0]}' (score: {best_desc_match[1]})."
-            return err_msg + f" Available: {available_devices[:5]}"
+            err_msg = f"Простите, я не смогла найти устройство, похожее на '{user_description}'."
+            if best_desc_match: err_msg += f" Самое похожее: '{best_desc_match[0]}' (совпадение: {best_desc_match[1]})."
+            # Limiting the list of available devices for brevity in speech
+            available_devices_str = ", ".join(available_devices[:3]) + (" и другие." if len(available_devices) > 3 else ".")
+            return err_msg + f" Доступные устройства: {available_devices_str}"
+
 
     if not target_device_name: # Should not happen if logic above is correct
-        return "Sorry, could not identify the target device."
+        return "Простите, не удалось определить целевое устройство."
 
     logger.info(f"Core Logic: Target device identified as '{target_device_name}'")
 
     # --- 2. Get capabilities ---
     capabilities = comm_service.get_device_capabilities(target_device_name)
     if capabilities is None:
-        return f"Sorry, could not get capabilities for '{target_device_name}'."
+        return f"Простите, не удалось получить характеристики для устройства '{target_device_name}'."
 
     # --- 3. Find capability ---
     capability_details = find_capability(capabilities, attribute)
     if not capability_details:
-        # ... (error message as before) ...
         available_attrs = list(capabilities.keys())
         fuzzy_attr_match = fuzz_process.extractOne(attribute, available_attrs, scorer=fuzz.token_sort_ratio, score_cutoff=80)
-        suggestion = f" Did you mean '{fuzzy_attr_match[0]}'?" if fuzzy_attr_match else ""
-        return f"Sorry, '{target_device_name}' doesn't support '{attribute}'.{suggestion} Available: {available_attrs[:5]}"
+        suggestion = f" Возможно, вы имели в виду '{fuzzy_attr_match[0]}'?" if fuzzy_attr_match else ""
+        # Limiting the list of available attributes for brevity in speech
+        available_attrs_str = ", ".join(available_attrs[:3]) + (" и другие." if len(available_attrs) > 3 else ".")
+        return f"Простите, устройство '{target_device_name}' не поддерживает атрибут '{attribute}'.{suggestion} Доступные атрибуты: {available_attrs_str}"
 
 
     # --- 4. Check access ---
     if not (capability_details.get("access", 0) & 2):
-        return f"Sorry, '{capability_details.get('name', attribute)}' on '{target_device_name}' is read-only."
+        return f"Простите, атрибут '{capability_details.get('name', attribute)}' на устройстве '{target_device_name}' доступен только для чтения."
 
     # --- 5. Transform, validate value, create payload ---
-    # (This extensive logic for color, color_temp, numeric, binary, enum remains the same)
-    # Ensure it uses `comm_service` where needed (though it mostly uses capability_details)
-    # and `settings` for topic base.
     cap_type = capability_details.get("type")
     cap_name_from_expose = capability_details.get('name', attribute)
     mqtt_attribute_name = capability_details.get('property', cap_name_from_expose)
     if not mqtt_attribute_name:
-         return f"Internal error: Could not find MQTT property for '{attribute}' on '{target_device_name}'."
+         return f"Внутренняя ошибка при настройке атрибута '{attribute}' для устройства '{target_device_name}'."
 
     payload_dict = None
     final_value_repr = value 
@@ -160,74 +161,79 @@ async def _set_device_attribute_core_logic( # NEW ASYNC HELPER FUNCTION
         elif cap_type == 'composite' and mqtt_attribute_name == 'color':
             supports_xy = all(p in [f.get('property') for f in capability_details.get('features', [])] for p in ['x', 'y'])
         if not supports_xy:
-             return f"Device '{target_device_name}' doesn't support XY color control."
+             return f"Устройство '{target_device_name}' не поддерживает такой способ управления цветом."
         normalized_color = normalize_text_key(value)
         if normalized_color in COLOR_NAME_TO_XY:
             xy_coords = COLOR_NAME_TO_XY[normalized_color]
             payload_dict = {"color": {"x": xy_coords[0], "y": xy_coords[1]}}
-            final_value_repr = f"{normalized_color} (xy: {xy_coords})"
+            final_value_repr = f"{normalized_color} (xy: {xy_coords})" # Keep original color name for speech
         else:
-            return f"Unrecognized color '{value}'. Try red, blue, etc."
+            return f"Неизвестный цвет '{value}'. Попробуйте, например, красный, синий и т.д."
     elif mqtt_attribute_name == 'color_temp' or (cap_name_from_expose == 'color_temp' and cap_type == 'light'):
         normalized_value_key = normalize_text_key(value)
         preset_mired_value = COLOR_TEMP_PRESETS.get(normalized_value_key)
         final_mired_value = None
         if preset_mired_value is not None:
             final_mired_value = preset_mired_value
-            final_value_repr = f"{normalized_value_key} ({preset_mired_value} Mired)"
+            final_value_repr = f"{normalized_value_key} ({preset_mired_value} Mired)" # Keep original preset name for speech
         else:
-            if 'k' in value.lower(): return "Kelvin not supported. Use Mired or presets."
+            if 'k' in value.lower() or 'кельвин' in value.lower(): return "Указание температуры в Кельвинах не поддерживается. Используйте Майреды или стандартные значения (например, теплый, холодный)."
             parsed_as_numeric = parse_value(value, "numeric")
             if isinstance(parsed_as_numeric, (int, float)):
                 final_mired_value = parsed_as_numeric; final_value_repr = str(final_mired_value)
-            else: return f"'{value}' not a recognized color temp preset or Mired value."
+            else: return f"Значение '{value}' не является известным пресетом цветовой температуры или значением в Майредах."
         if final_mired_value is not None:
             min_val = capability_details.get("value_min"); max_val = capability_details.get("value_max")
             if (min_val is not None and final_mired_value < min_val) or \
                (max_val is not None and final_mired_value > max_val):
-                return f"Value {final_mired_value} for color_temp out of range ({min_val}-{max_val})."
+                return f"Значение {final_mired_value} для цветовой температуры вне допустимого диапазона ({min_val}-{max_val})."
             payload_dict = {mqtt_attribute_name: int(round(final_mired_value))}
     else:
         parsed_value = parse_value(value, cap_type)
         final_value = parsed_value
         final_value_repr = str(final_value) if final_value is not None else value
-        if final_value is None and cap_type != "enum":
-             return f"Couldn't understand value '{value}' for '{cap_name_from_expose}' (type: {cap_type})."
+        if final_value is None and cap_type != "enum": # For enum, the raw string value might be valid
+             return f"Не удалось распознать значение '{value}' для атрибута '{cap_name_from_expose}'."
         if cap_type == "numeric":
-            if not isinstance(final_value, (int, float)): return f"Expected numeric for '{cap_name_from_expose}', got '{value}'."
+            if not isinstance(final_value, (int, float)): return f"Ожидалось числовое значение для '{cap_name_from_expose}', получено '{value}'."
             if (mqtt_attribute_name == 'brightness' or cap_name_from_expose == 'brightness') and isinstance(value, str) and '%' in value:
                  try:
                      percent = float(value.replace('%','').strip()); percent = max(0.0, min(100.0, percent))
                      abs_max = float(capability_details.get("value_max", 254.0)); abs_min = float(capability_details.get("value_min", 0.0))
                      calc_value = abs_min + (abs_max - abs_min) * (percent / 100.0)
-                     final_value = int(round(calc_value)); final_value_repr = f"{percent}% ({final_value})"
-                 except (ValueError, TypeError): return f"Couldn't parse percentage '{value}' for brightness."
+                     final_value = int(round(calc_value)); final_value_repr = f"{int(percent)}%" # Speak as percentage
+                 except (ValueError, TypeError): return f"Не удалось разобрать процентное значение '{value}' для яркости."
             min_val = capability_details.get("value_min"); max_val = capability_details.get("value_max")
             if (min_val is not None and final_value < min_val) or \
                (max_val is not None and final_value > max_val):
-                return f"Value {final_value} for '{cap_name_from_expose}' out of range ({min_val}-{max_val})."
+                return f"Значение {final_value} для '{cap_name_from_expose}' вне допустимого диапазона ({min_val}-{max_val})."
             payload_dict = {mqtt_attribute_name: final_value}
         elif cap_type == "binary":
+            # parse_value already returns "ON", "OFF", "TOGGLE" or None
             allowed_vals = [capability_details.get("value_on", "ON"), capability_details.get("value_off", "OFF")]
             if capability_details.get("value_toggle"): allowed_vals.append(capability_details.get("value_toggle"))
-            if final_value not in allowed_vals: return f"Invalid state '{value}'. Allowed: {allowed_vals}"
+            if final_value not in allowed_vals: return f"Недопустимое состояние '{value}'. Разрешено: {', '.join(allowed_vals)}"
             payload_dict = {mqtt_attribute_name: final_value}
         elif cap_type == "enum":
             allowed_enum = capability_details.get("values")
+            # For enum, final_value is the raw string if parse_value didn't map it.
+            # We need to check if this raw string is in allowed_enum.
+            # If parse_value did some normalization, it should be reflected here.
+            # Assuming final_value is what we want to check against allowed_enum.
             if not allowed_enum or final_value not in allowed_enum:
                 suggestion = ""
                 if allowed_enum:
                     enum_match = fuzz_process.extractOne(value, allowed_enum, scorer=fuzz.token_sort_ratio, score_cutoff=75)
-                    if enum_match: suggestion = f" Did you mean '{enum_match[0]}'?"
-                return f"Invalid option '{value}' for '{cap_name_from_expose}'.{suggestion} Allowed: {allowed_enum}"
+                    if enum_match: suggestion = f" Возможно, вы имели в виду '{enum_match[0]}'?"
+                return f"Недопустимый вариант '{value}' для '{cap_name_from_expose}'.{suggestion} Разрешенные варианты: {', '.join(allowed_enum[:3])}{'...' if len(allowed_enum) > 3 else ''}"
             payload_dict = {mqtt_attribute_name: final_value}
         elif cap_type == "text" or cap_type == "string":
             payload_dict = {mqtt_attribute_name: final_value}
         else:
-            return f"I don't know how to set attribute '{cap_name_from_expose}' of type '{cap_type}'."
+            return f"Я не знаю, как установить атрибут '{cap_name_from_expose}'."
 
     if payload_dict is None:
-        return f"Internal error: Could not determine payload for '{attribute}' on '{target_device_name}' with value '{value}'."
+        return f"Внутренняя ошибка: Не удалось сформировать команду для установки атрибута '{attribute}' на устройстве '{target_device_name}' со значением '{value}'."
 
     # --- 6. Send Command ---
     payload_json = json.dumps(payload_dict)
@@ -238,9 +244,14 @@ async def _set_device_attribute_core_logic( # NEW ASYNC HELPER FUNCTION
     success = await comm_service.publish(topic, payload_json, qos=1)
 
     if success:
-        return f"Okay. '{target_device_name}' {cap_name_from_expose} set to {final_value_repr}."
+        # For state, make it more natural
+        if cap_name_from_expose == "state":
+            state_translation = {"ON": "включено", "OFF": "выключено", "TOGGLE": "переключено"}
+            spoken_value = state_translation.get(str(final_value).upper(), str(final_value_repr))
+            return f"Окей. Устройство '{target_device_name}' {spoken_value}."
+        return f"Окей. Атрибут {cap_name_from_expose} устройства '{target_device_name}' установлен на {final_value_repr}."
     else:
-        return f"Sorry, there was an issue sending the command for '{target_device_name}'."
+        return f"Простите, возникла проблема при отправке команды для устройства '{target_device_name}'."
 
 
 @tool
@@ -263,7 +274,7 @@ async def set_device_attribute( # This is what the LLM will call
     global TOOL_COMM_SERVICE # Still uses the injected global comm_service
     if TOOL_COMM_SERVICE is None:
         logger.error("Tool set_device_attribute: communication service not initialized.")
-        return "Error: Device control service is not ready (tool not initialized)."
+        return "Простите, сервис управления устройствами не готов. Я не могу выполнить команду."
 
     # Delegate to the core logic function
     return await _set_device_attribute_core_logic(
