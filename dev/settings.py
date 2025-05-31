@@ -152,7 +152,7 @@ class OllamaSettings: # For Offline LLM
     base_url: Optional[str] = os.getenv("OLLAMA_BASE_URL", "http://localhost:8082")
     model: Optional[str] = os.getenv("OLLAMA_MODEL", "qwen:1b") # Or your preferred model
     temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", 0.8))
-    system_prompt: Optional[str] = os.getenv("OLLAMA_SYSTEM_PROMPT", "You are a helpful offline assistant.")
+    system_prompt: Optional[str] = os.getenv("OLLAMA_SYSTEM_PROMPT", "You are Lumi, an efficient AI voice assistant.")
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@ import logging
 from typing import Union, Dict, Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
-from langchain_community.chat_models import ChatOllama # Ensure langchain_community is installed
+from langchain_ollama import ChatOllama
 
 from .base import LLMLogicEngineBase
 from settings import OllamaSettings # Specific settings for Ollama
