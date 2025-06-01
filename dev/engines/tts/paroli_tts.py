@@ -70,7 +70,27 @@ class ParoliTTSEngine(TTSEngineBase):
             stderr_task = asyncio.create_task(self._read_stream(self.paroli_server_process.stderr, "paroli-stderr"))
             self.paroli_log_reader_task = asyncio.gather(stdout_task, stderr_task)
 
-            await asyncio.sleep(3.0) 
+            healthy_attempts = 5
+            attempt_delay = 1.0
+            server_ready = False
+            for i in range(healthy_attempts):
+                await asyncio.sleep(attempt_delay) # Дать время серверу инициализироваться перед проверкой
+                if self.paroli_server_process.returncode is not None:
+                    logger.error(f"Paroli server process exited during startup check with code: {self.paroli_server_process.returncode}")
+                    break # Выход из цикла проверки
+                if await self.is_healthy(check_process_exists=False): # check_process_exists=False чтобы не было рекурсии логов
+                    server_ready = True
+                    logger.info("Paroli server confirmed healthy after startup.")
+                    break
+                logger.info(f"Paroli server not healthy yet, attempt {i+1}/{healthy_attempts}...")
+
+            if not server_ready:
+                logger.error("Paroli server did not become healthy after startup attempts.")
+                # Здесь можно решить остановить процесс, если он все еще запущен, но не здоров
+                if self.paroli_server_process and self.paroli_server_process.returncode is None:
+                    logger.warning("Paroli server process is running but not healthy. Consider stopping it.")
+                    # await self.shutdown() # Опционально, если хотим остановить нездоровый сервер
+                # self.paroli_server_process = None # Если решили, что он неработоспособен
 
             if self.paroli_server_process.returncode is not None:
                 logger.error(f"Paroli server process exited immediately with code: {self.paroli_server_process.returncode}")
@@ -112,19 +132,19 @@ class ParoliTTSEngine(TTSEngineBase):
                     self.paroli_server_process.kill()
                     await self.paroli_server_process.wait()
                     logger.info(f"Paroli server process (PID: {pid}) killed.")
-                except Exception as kill_err: # Catch ProcessLookupError here too
+                except (Exception, ProcessLookupError) as kill_err: # Добавить ProcessLookupError
                     logger.error(f"Error killing paroli-server process (PID: {pid}): {kill_err}")
-            except Exception as term_err: # Catch ProcessLookupError here too
+            except (Exception, ProcessLookupError) as term_err:
                 logger.error(f"Error terminating paroli-server process (PID: {pid}): {term_err}")
             finally:
                 self.paroli_server_process = None
         else:
             logger.info("Paroli server process not running or already stopped.")
             
-    async def is_healthy(self) -> bool:
+    async def is_healthy(self, check_process_exists: bool = True) -> bool:
         if not self.settings.ws_url:
             return False
-        if self.paroli_server_process is None or self.paroli_server_process.returncode is not None:
+        if check_process_exists and (self.paroli_server_process is None or self.paroli_server_process.returncode is not None):
             logger.warning("Paroli server process not running, TTS unhealthy.")
             return False
         try:
