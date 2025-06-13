@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from typing import Annotated, Union, Dict, Any, List, Optional
 
 from langchain_core.messages import ( # Убедитесь, что SystemMessage импортирован
@@ -30,6 +31,7 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.ai_settings: AISettings = config["ai_settings"]
+        self.mem0_client: Optional[Any] = config.get("mem0_client")
         self.graph = None
         self.memory = None
         self.llm_with_tools = None
@@ -185,6 +187,44 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
         messages_to_update_state.append(response_message)
         
         return {"messages": messages_to_update_state}
+    
+
+    async def _add_conversation_to_memory(self, messages_to_add: List[BaseMessage], thread_id: str):
+        """
+        Асинхронная фоновая задача для добавления сообщений в долговременную память.
+        Принимает список объектов BaseMessage и форматирует их в список словарей.
+        """
+        if not self.mem0_client or not messages_to_add:
+            return
+
+        try:
+            # Словарь для преобразования типов LangChain в роли, понятные mem0
+            role_map = {
+                "human": "user",
+                "ai": "assistant",
+                "system": "system", 
+            }
+
+            # Преобразуем список объектов BaseMessage в список словарей
+            formatted_messages = [
+                {"role": role_map.get(msg.type), "content": msg.content}
+                for msg in messages_to_add
+                if msg.type in role_map and msg.content
+            ]
+
+            if not formatted_messages:
+                logger.warning("No messages to add to memory after formatting.")
+                return
+
+            logger.debug(f"Adding conversation context to long-term memory for thread '{thread_id}'. Messages: {formatted_messages}")
+            
+            # Передаем в mem0 отформатированный список сообщений
+            await self.mem0_client.add(messages=formatted_messages, user_id=thread_id)
+            
+            logger.info(f"Successfully tasked adding context of {len(formatted_messages)} messages to long-term memory for thread '{thread_id}'.")
+        except Exception as e:
+            logger.error(f"Background task to add memory failed: {e}", exc_info=True)
+
 
     async def ask(self, question: str, thread_id: str, return_full: bool = False) -> Union[str, BaseMessage]:
         if not self.graph:
@@ -193,9 +233,8 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
 
         graph_config = {"configurable": {"thread_id": thread_id}}
         
-        # Input for the graph: the new user question.
-        # This HumanMessage will be part of `current_messages_from_state` in `_chatbot_node_func`
-        input_data = {"messages": [HumanMessage(content=question)]}
+        input_message = HumanMessage(content=question)
+        input_data = {"messages": [input_message]}
 
         logger.debug(f"Invoking LangGraph for thread_id='{thread_id}' with new question.")
         
@@ -213,6 +252,22 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
                 last_ai_message = msg
                 break
         
+        # --- ФОНОВОЕ ДОБАВЛЕНИЕ В ПАМЯТЬ (КОНТЕКСТОМ) ---
+        if self.mem0_client:
+            # Определяем, сколько сообщений мы хотим сохранить как контекст.
+            # 4 сообщения = 2 последних витка диалога (user -> assistant, user -> assistant)
+            CONTEXT_SIZE_FOR_MEMORY = 4 
+            
+            # Берем срез из последних сообщений.
+            messages_to_store = all_messages[-CONTEXT_SIZE_FOR_MEMORY:]
+            
+            if messages_to_store:
+                # Запускаем сохранение в память как фоновую задачу.
+                asyncio.create_task(
+                    self._add_conversation_to_memory(messages_to_store, thread_id)
+                )
+        # --- КОНЕЦ БЛОКА ---
+
         if last_ai_message:
             logger.info(f"LLM response for thread_id='{thread_id}' successfully retrieved. Total messages in state: {len(all_messages)}.")
             if return_full:

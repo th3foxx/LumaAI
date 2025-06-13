@@ -13,9 +13,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 
 # Project specific imports
-from settings import settings, Settings, AudioSettings, SoundDeviceSettings # Добавить SoundDeviceSettings
+from settings import settings, Settings, AudioSettings, SoundDeviceSettings, Mem0Settings
 # MODIFIED: Import new functions from connectivity
 from connectivity import is_internet_available, start_connectivity_monitoring, stop_connectivity_monitoring 
+# Добавьте этот импорт
+from tools.memory import initialize_memory_tools
+from mem0 import AsyncMemory
 
 from tools.scheduler import init_db as init_scheduler_db
 from utils.music_db import init_music_likes_table
@@ -64,6 +67,7 @@ audio_input_engine: Optional[AudioInputEngineBase] = None
 audio_output_engine: Optional[AudioOutputEngineBase] = None
 comm_service: Optional[CommunicationServiceBase] = None
 offline_command_processor: Optional[OfflineCommandProcessorBase] = None
+mem0_client: Optional[Any] = None
 
 class ConnectionManager: pass
 manager: Optional[ConnectionManager] = None
@@ -126,6 +130,7 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
             if engine_name == "langgraph":
                 return LangGraphLLMEngine(config={
                     "ai_settings": global_settings.ai,
+                    "mem0_client": mem0_client,
                 })
         elif engine_type == "offline_llm_logic":
              if engine_name == "ollama":
@@ -164,6 +169,7 @@ async def initialize_global_engines(app_settings: Settings):
     global llm_logic_engine, offline_llm_logic_engine
     global audio_input_engine, audio_output_engine, comm_service, manager
     global offline_command_processor
+    global mem0_client
 
     logger.info("Initializing global engines...")
 
@@ -181,6 +187,171 @@ async def initialize_global_engines(app_settings: Settings):
     else:
         offline_command_processor = None
         logger.warning("OfflineCommandProcessor not initialized as comm_service is unavailable.")
+    
+    CUSTOM_FACT_EXTRACTION_PROMPT = """
+    You are an expert in extracting personal, long-lasting facts about a user from a conversation.
+    Your goal is to identify key pieces of information about the user's identity, preferences, relationships, and plans.
+    Extract these as short, concise, third-person facts (e.g., "Likes blue" instead of "I like blue").
+
+    **Guidelines:**
+    - The user is the subject of all facts. Pronouns like "I", "me", "my" refer to the user.
+    - **CRITICAL: Do NOT extract questions, commands, greetings, or conversational fillers (e.g., 'okay', 'I see'). Only extract new, declarative information about the user.**
+    - **CRITICAL: Do NOT extract temporary or one-time information like 'I need to buy milk today' unless it's a long-term plan.**
+    - If no personal facts are mentioned, return an empty list of facts.
+    - Combine related information from a single user turn into a more descriptive fact.
+
+    **Few-shot examples:**
+
+    Input: Hi, how are you?
+    Output: {{"facts": []}}
+
+    Input: I like the color blue.
+    Output: {{"facts": ["Likes the color blue"]}}
+
+    Input: My name is Dmitry.
+    Output: {{"facts": ["Name is Dmitry"]}}
+
+    Input: I have a friend who lives in Tyumen. His name is Nikita.
+    Output: {{"facts": ["Has a friend named Nikita who lives in Tyumen"]}}
+
+    Input: I like pizza, but I'm allergic to mushrooms.
+    Output: {{"facts": ["Likes pizza", "Is allergic to mushrooms"]}}
+
+    Input: Remind me to call my mom tomorrow.
+    Output: {{"facts": ["Needs to call mom tomorrow"]}} # This is a plan, so it's a valid fact.
+
+    Input: Turn on the light.
+    Output: {{"facts": []}} # This is a command, not a fact.
+
+    Return the extracted facts in a JSON format with a "facts" key as shown in the examples.
+    """
+
+    CUSTOM_UPDATE_MEMORY_PROMPT = """You are a smart memory manager for a personal AI assistant.
+    You can perform four operations on the user's memory: (1) ADD, (2) UPDATE, (3) DELETE, and (4) NONE (no change).
+
+    Compare the "Retrieved facts" with the "Old Memory". For each fact, decide on an operation.
+
+    **Guidelines:**
+
+    1.  **ADD**: If a retrieved fact is completely new and doesn't relate to any existing memory, add it.
+        -   Example:
+            -   Old Memory: [{"id": "0", "text": "Likes pizza"}]
+            -   Retrieved facts: ["Name is Dmitry"]
+            -   Result: [{"id": "0", "event": "NONE"}, {"id": "1", "text": "Name is Dmitry", "event": "ADD"}]
+
+    2.  **UPDATE**: If a retrieved fact provides more detail or updates an existing memory, update it.
+        -   **CRITICAL RULE:** When updating, you MUST combine the old memory with the new information into a single, more comprehensive fact. **DO NOT lose details from the old memory.**
+        -   Example 1 (Good Update):
+            -   Old Memory: [{"id": "0", "text": "Has a friend"}]
+            -   Retrieved facts: ["Friend's name is Nikita"]
+            -   Result: [{"id": "0", "text": "Has a friend named Nikita", "event": "UPDATE", "old_memory": "Has a friend"}]
+        -   Example 2 (Good Update - Combining):
+            -   Old Memory: [{"id": "0", "text": "Has a friend named Nikita"}]
+            -   Retrieved facts: ["Nikita lives in Tyumen"]
+            -   Result: [{"id": "0", "text": "Has a friend named Nikita who lives in Tyumen", "event": "UPDATE", "old_memory": "Has a friend named Nikita"}]
+
+    3.  **DELETE**: If a fact is explicitly negated or becomes irrelevant, delete it.
+        -   Example:
+            -   Old Memory: [{"id": "0", "text": "Likes thriller movies"}]
+            -   Retrieved facts: ["Doesn't like thriller movies anymore"]
+            -   Result: [{"id": "0", "event": "DELETE"}]
+
+    4.  **NONE**: If a fact is identical or a less-detailed version of an existing memory, do nothing.
+        -   Example:
+            -   Old Memory: [{"id": "0", "text": "Has a friend named Nikita who lives in Tyumen"}]
+            -   Retrieved facts: ["Has a friend in Tyumen"]
+            -   Result: [{"id": "0", "event": "NONE"}]
+
+    Your output for the whole memory block must be a single JSON object with a "memory" key.
+    """
+    CUSTOM_GRAPH_PROMPT = (
+        "You are a data extraction expert. From the provided text, which is a single fact about a user, "
+        "extract entities and relationships to build a knowledge graph. "
+        "The main node is always 'User'. Link all relevant information to it.\n\n"
+        "**Rules:**\n"
+        "1. Node names (entities) MUST be in TitleCase (e.g., 'Nikita', 'Tyumen', 'Pizza').\n"
+        "2. Relationship names MUST be in UPPER_SNAKE_CASE (e.g., 'HAS_FRIEND', 'LIVES_IN').\n"
+        "3. Always try to break down complex facts into multiple simple relationships.\n\n"
+        "**Examples:**\n\n"
+        "Input text: 'Has a friend named Nikita who lives in Tyumen'\n"
+        "Output Graph: (User)-[HAS_FRIEND]->(Nikita), (Nikita)-[LIVES_IN]->(Tyumen)\n\n"
+        "Input text: 'Likes pizza'\n"
+        "Output Graph: (User)-[LIKES]->(Pizza)\n\n"
+        "Input text: 'Is allergic to mushrooms'\n"
+        "Output Graph: (User)-[IS_ALLERGIC_TO]->(Mushrooms)\n\n"
+        "Input text: 'Name is Dmitry'\n"
+        "Output Graph: (User)-[HAS_NAME]->(Dmitry)\n\n"
+        "Input text: 'Needs to call mom tomorrow'\n"
+        "Output Graph: (User)-[HAS_PLAN]->(Call Mom), (Call Mom)-[SCHEDULED_FOR]->(Tomorrow)\n\n"
+        "Input text: 'His wife's name is Anna'\n"
+        "Output Graph: (User)-[HAS_WIFE]->(Anna)"
+    )
+    
+    # --- Инициализация клиента памяти ---
+    if AsyncMemory and app_settings.mem0.enabled:
+        # Проверяем наличие обязательных настроек для баз данных
+        if not all([app_settings.mem0.neo4j_url, app_settings.mem0.neo4j_password, app_settings.mem0.qdrant_url]):
+            logger.error("Missing required settings for Mem0 (NEO4J_URL, NEO4J_PASSWORD, QDRANT_URL). Long-term memory will be disabled.")
+        else:
+            try:
+                # --- Установка ключей API в переменные окружения для LiteLLM ---
+                mem0_config = {
+                    "llm": {
+                        "provider": "openai",
+                        "config": {
+                            "openai_base_url": app_settings.mem0.openai_api_base,
+                            "api_key": app_settings.mem0.openrouter_api_key,
+                            "model": app_settings.mem0.llm_model,
+                            "temperature": 0.2,
+                            "max_tokens": 2000,
+                        },
+                    },
+                    "embedder": {
+                        "provider": app_settings.mem0.embedder_provider,
+                        "config": {
+                            "model": app_settings.mem0.embedder_model,
+                            "embedding_dims": app_settings.mem0.embedding_dims,
+                        },
+                    },
+                    "graph_store": {
+                        "provider": "neo4j",
+                        "config": {
+                            "url": app_settings.mem0.neo4j_url,
+                            "username": app_settings.mem0.neo4j_user,
+                            "password": app_settings.mem0.neo4j_password,
+                        },
+                        "custom_prompt": CUSTOM_GRAPH_PROMPT,
+                    },
+                    "vector_store": {
+                        "provider": "qdrant",
+                        "config": {
+                            "collection_name": app_settings.mem0.qdrant_collection_name,
+                            "url": app_settings.mem0.qdrant_url,
+                            "embedding_model_dims": app_settings.mem0.embedding_dims,
+                        },
+                    },
+                    "custom_fact_extraction_prompt": CUSTOM_FACT_EXTRACTION_PROMPT,
+                    "custom_update_memory_prompt": CUSTOM_UPDATE_MEMORY_PROMPT,
+                    "version": "v1.1",
+                }
+                
+                if app_settings.mem0.qdrant_api_key:
+                    mem0_config["vector_store"]["config"]["api_key"] = app_settings.mem0.qdrant_api_key
+
+                logger.info(f"Initializing Mem0 client with LLM '{app_settings.mem0.llm_model}'...")
+                mem0_client = await AsyncMemory.from_config(mem0_config)
+                
+                initialize_memory_tools(client=mem0_client, user_id=ASSISTANT_THREAD_ID)
+                logger.info("Mem0 long-term memory client initialized successfully using OpenRouter.")
+
+            except Exception as e:
+                logger.error(f"Failed to initialize Mem0 client from config: {e}", exc_info=True)
+                mem0_client = None
+    else:
+        if not AsyncMemory:
+            logger.warning("Mem0 library not found, skipping long-term memory initialization.")
+        elif not app_settings.mem0.enabled:
+            logger.info("Mem0 is disabled in settings, skipping long-term memory initialization.")
 
     wake_word_engine = create_engine_instance("wake_word", app_settings.engines.wake_word_engine, app_settings)
     vad_engine = create_engine_instance("vad", app_settings.engines.vad_engine, app_settings)
