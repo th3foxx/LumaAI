@@ -1,260 +1,231 @@
-# --- START OF FILE engines/llm_logic/langgraph_llm.py (Async _call_model) ---
-import asyncio
-import atexit
+import os
 import logging
-from functools import cache
-from typing import Union, Dict, Any, List, Optional
+from typing import Annotated, Union, Dict, Any, List, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_core.messages import ( # Убедитесь, что SystemMessage импортирован
+    BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage, RemoveMessage
+)
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.store.base import BaseStore
-from langgraph.store.postgres import PostgresStore
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver 
 
-from tools import TOOLS # TOOLS should contain async tools where appropriate
+from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
 
-from .base import LLMLogicEngineBase
-from settings import AISettings, PostgresSettings
+from typing_extensions import TypedDict
+
+from settings import AISettings
+from tools import TOOLS as project_tools
+from engines.llm_logic.base import LLMLogicEngineBase
+
+class State(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
 
 logger = logging.getLogger(__name__)
 
-def init_embeddings_internal(model_name: str, ai_settings: AISettings):
-    if "openai" in model_name.lower() or "gpt" in model_name.lower():
-        return OpenAIEmbeddings(
-            model="text-embedding-ada-002",
-            openai_api_key=ai_settings.openai_api_key,
-            openai_api_base=ai_settings.openai_api_base if ai_settings.openai_api_base else None
-        )
-    elif "google_vertexai" in model_name.lower():
-        try:
-            from langchain_google_vertexai import VertexAIEmbeddings
-            return VertexAIEmbeddings(model_name=model_name.split(':')[-1].strip())
-        except ImportError:
-            logger.error("langchain-google-vertexai not installed. Cannot use VertexAI embeddings.")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize VertexAIEmbeddings: {e}")
-            raise
-    else:
-        raise ValueError(f"Unsupported embedding model type in init_embeddings_internal: {model_name}")
-
+DEFAULT_MAX_CONVERSATION_MESSAGES = 20
+MIN_CONVERSATION_MESSAGES = 8
 
 class LangGraphLLMEngine(LLMLogicEngineBase):
     def __init__(self, config: Dict[str, Any]):
-        self.ai_settings: AISettings = config.get("ai_settings")
-        self.postgres_settings: PostgresSettings = config.get("postgres_settings")
+        super().__init__(config)
+        self.ai_settings: AISettings = config["ai_settings"]
+        self.graph = None
+        self.memory = None
+        self.llm_with_tools = None
+        self.max_conversation_messages: int = DEFAULT_MAX_CONVERSATION_MESSAGES
         
-        if not all([self.ai_settings, self.postgres_settings]):
-            raise ValueError("LangGraphLLMEngine requires 'ai_settings' and 'postgres_settings' in config")
+        # Получение системного промпта из настроек
+        self.system_prompt_content: str = self.ai_settings.system_prompt 
+        logger.info(f"Using system prompt: '{self.system_prompt_content[:100]}...'")
 
-        self._llm: Optional[ChatOpenAI] = None
-        self._agent_model: Optional[Any] = None
-        self._tool_node: Optional[ToolNode] = None
-        self._store_cm = None
-        self._store: Optional[BaseStore] = None
-        self._checkpointer = MemorySaver() 
-        self._app: Optional[Any] = None
-        self._system_prompt: Optional[SystemMessage] = None
-        self._atexit_registered = False
 
-    def _get_store(self) -> BaseStore:
-        if self._store is None:
-            logger.info(f"LLM Engine: Initializing PostgresStore for vector search with URI: {self.postgres_settings.uri.split('@')[-1]}")
-            try:
-                embeddings = init_embeddings_internal(self.ai_settings.embedding_model, self.ai_settings)
-            except Exception as e:
-                logger.error(f"LLM Engine: Failed to initialize embedding model '{self.ai_settings.embedding_model}': {e}", exc_info=True)
-                raise RuntimeError(f"Could not initialize embedding model for PostgresStore: {e}") from e
+        if not self.ai_settings.openai_api_base:
+            logger.error("OPENAI_API_BASE is not set. LangGraphLLMEngine requires it for the LLM.")
+            raise ValueError("OPENAI_API_BASE is required for LangGraphLLMEngine.")
 
-            index_cfg = {"dims": self.ai_settings.embedding_dims, "embed": embeddings}
-            try:
-                self._store_cm = PostgresStore.from_conn_string(self.postgres_settings.uri, index=index_cfg)
-                self._store = self._store_cm.__enter__()
-                self._store.setup()
-                logger.info("LLM Engine: PostgresStore (for vector search) initialized and setup complete.")
-                if not self._atexit_registered:
-                    atexit.register(self._close_store_atexit)
-                    self._atexit_registered = True
-            except Exception as e:
-                logger.error(f"LLM Engine: Failed to initialize or setup PostgresStore: {e}", exc_info=True)
-                raise RuntimeError("Could not connect to or setup the LangGraph PostgresStore.") from e
-        return self._store
+        api_key_to_use = self.ai_settings.openai_api_key
+        if not api_key_to_use:
+            logger.warning(
+                f"OPENAI_API_KEY is not set. This may cause issues if the endpoint "
+                f"'{self.ai_settings.openai_api_base}' requires authentication."
+            )
 
-    def _close_store_atexit(self):
-        if self._store_cm:
-            logger.info("LLM Engine (atexit): Closing PostgresStore connection...")
-            try:
-                self._store_cm.__exit__(None, None, None)
-            except Exception as e:
-                logger.error(f"LLM Engine (atexit): Error closing PostgresStore: {e}", exc_info=True)
-            self._store = None; self._store_cm = None
-
-    def _filter_messages(self, messages: List[BaseMessage]) -> List[BaseMessage]:
-        if not messages: return []
-        has_system = isinstance(messages[0], SystemMessage)
-        system = messages[0] if has_system else None
-        history_start_index = 1 if has_system else 0
-        recent = messages[max(history_start_index, len(messages) - self.ai_settings.history_length):]
-        filtered = []
-        if system: filtered.append(system)
-        filtered.extend(recent)
-        return filtered
-
-    async def _call_model(self, state: MessagesState) -> MessagesState: # <<< MADE ASYNC
-        filtered_msgs = self._filter_messages(state["messages"])
-        if not filtered_msgs:
-            logger.warning("LLM Engine: _call_model received empty state messages after filtering.")
-            return {"messages": [HumanMessage(content="Error: No messages to process.")]}
-        
-        logger.debug(f"LLM Engine: Calling agent model with {len(filtered_msgs)} messages.")
-        try:
-            response = await self._agent_model.ainvoke(filtered_msgs) # <<< CHANGED TO AINVOKE
-            return {"messages": [response]}
-        except Exception as e:
-            logger.error(f"LLM Engine: Error invoking agent model: {e}", exc_info=True)
-            error_msg = HumanMessage(content=f"Sorry, I encountered an error with the AI model: {e}")
-            return {"messages": [error_msg]}
-
-    def _should_continue(self, state: MessagesState) -> str:
-        # This node is typically CPU-bound (inspecting state), so sync is fine.
-        last_msg = state["messages"][-1] if state["messages"] else None
-        if last_msg and hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-            if not any(tc.get("name") for tc in last_msg.tool_calls):
-                logger.warning("LLM Engine: Agent returned tool_calls, but they are empty. Ending turn.")
-                return END
-            logger.info(f"LLM Engine: Agent requested tool(s): {[tc.get('name') for tc in last_msg.tool_calls if tc.get('name')]}") # Added safety check
-            return "action"
+        configured_max_messages = getattr(self.ai_settings, 'max_conversation_messages', DEFAULT_MAX_CONVERSATION_MESSAGES)
+        if configured_max_messages < MIN_CONVERSATION_MESSAGES:
+            logger.warning(
+                f"Configured 'max_conversation_messages' ({configured_max_messages}) is less than "
+                f"the minimum allowed ({MIN_CONVERSATION_MESSAGES}). "
+                f"Using minimum value: {MIN_CONVERSATION_MESSAGES}."
+            )
+            self.max_conversation_messages = MIN_CONVERSATION_MESSAGES
         else:
-            logger.info("LLM Engine: Agent did not request tools. Ending turn.")
-            return END
-
-    def _build_workflow(self) -> StateGraph:
-        # Workflow definition itself doesn't change whether nodes are sync or async
-        workflow = StateGraph(MessagesState)
-        workflow.add_node("agent", self._call_model) # LangGraph handles async node
-        workflow.add_node("action", self._tool_node) 
-        workflow.add_edge(START, "agent")
-        workflow.add_conditional_edges(
-            "agent",
-            self._should_continue,
-            {"action": "action", END: END}
-        )
-        workflow.add_edge("action", "agent")
-        logger.info("LLM Engine: LangGraph workflow built.")
-        return workflow
-
-    @cache
-    def _get_app_and_prompt_internal(self) -> tuple[Any, SystemMessage]:
-        logger.info("LLM Engine: Initializing LangGraph app and system prompt...")
+            self.max_conversation_messages = configured_max_messages
         
+        logger.info(f"Conversation history will be pruned to a maximum of {self.max_conversation_messages} messages. LLM will see up to {self.max_conversation_messages -1} messages (plus system prompt).")
+
+        logger.info(
+            f"Initializing ChatOpenAI for LangGraphLLMEngine with: "
+            f"Model='{self.ai_settings.grok_model}', "
+            f"Base URL='{self.ai_settings.openai_api_base}', "
+            f"Temperature='{self.ai_settings.temperature}'"
+        )
+
         try:
-            self._llm = ChatOpenAI(
-                openai_api_base=self.ai_settings.openai_api_base if self.ai_settings.openai_api_base else None,
-                openai_api_key=self.ai_settings.openai_api_key,
-                model_name=self.ai_settings.grok_model,
+            llm = ChatOpenAI(
+                model=self.ai_settings.grok_model,
+                api_key=api_key_to_use,
+                base_url=self.ai_settings.openai_api_base,
                 temperature=self.ai_settings.temperature,
             )
-            # .with_structured_output can also be used if tools require complex inputs
-            self._agent_model = self._llm.bind_tools(TOOLS) 
-            self._tool_node = ToolNode(TOOLS) 
-            logger.info(f"LLM Engine: ChatOpenAI initialized with model: {self.ai_settings.grok_model}")
         except Exception as e:
-            logger.error(f"LLM Engine: Failed to initialize ChatOpenAI: {e}", exc_info=True)
-            raise RuntimeError("Could not initialize the LLM for the engine.") from e
+            logger.error(f"Failed to initialize ChatOpenAI: {e}", exc_info=True)
+            raise ValueError(f"Could not initialize LLM for LangGraph: {e}") from e
 
-        store_instance = self._get_store()
-        workflow = self._build_workflow()
+        self.llm_with_tools = llm.bind_tools(project_tools if project_tools else [])
+        if project_tools:
+            logger.info(f"LLM bound with {len(project_tools)} tools.")
+        else:
+            logger.info("LLM initialized without any tools.")
+
+        graph_builder = StateGraph(State)
+        graph_builder.add_node("chatbot", self._chatbot_node_func)
         
-        app = workflow.compile(
-            checkpointer=self._checkpointer, 
-            store=store_instance            
-        )
-        logger.info("LLM Engine: LangGraph app compiled.")
+        tool_node = ToolNode(project_tools if project_tools else [])
+        graph_builder.add_node("tools", tool_node)
 
-        system_prompt = SystemMessage(
-            content=(
-                "You are Lumi, an efficient AI voice assistant. Your primary goal is to fulfill the user's request quickly and accurately. "
-                "You remember the last few turns of this conversation."
-                "Always respond in Russian unless asked otherwise."
-                "First, analyze the user's request. "
-                "DECIDE QUICKLY: Can you answer directly based on the conversation history or your general knowledge? "
-                "If YES, provide a concise answer immediately without using tools. "
-                "If NO, and the request requires external action (like controlling a device, searching memory, etc.) or information you don't have, IDENTIFY the necessary tool and its arguments. "
-                "After the tool runs, use its output to formulate your final, concise response to the user."
-                "Keep your spoken responses natural and brief."
+        graph_builder.add_conditional_edges("chatbot", tools_condition)
+        graph_builder.add_edge("tools", "chatbot")
+        graph_builder.set_entry_point("chatbot")
+
+        self.memory = MemorySaver()
+        self.graph = graph_builder.compile(checkpointer=self.memory)
+        logger.info("LangGraphLLMEngine initialized successfully with tools, memory-based checkpointer, message pruning, and system prompt.")
+
+    def _chatbot_node_func(self, state: State) -> Dict[str, List[BaseMessage]]:
+        current_messages_from_state: List[BaseMessage] = state["messages"]
+        logger.debug(f"Chatbot node: {len(current_messages_from_state)} messages in state. Max set to {self.max_conversation_messages}.")
+
+        messages_to_update_state: List[BaseMessage] = []
+        
+        # --- Determine messages to send to LLM ---
+        # LLM sees up to (max_conversation_messages - 1) messages from history, plus the system prompt.
+        # So, we take (max_conversation_messages - 1 - 1) if system prompt is always added.
+        # Or, more simply, the window of history messages is (max_conversation_messages - 1).
+        # The system prompt will be prepended to this window.
+
+        # The number of history messages to consider for LLM input (excluding system prompt)
+        num_history_messages_for_llm = self.max_conversation_messages - 1
+        if num_history_messages_for_llm < 0: # Should not happen with MIN_CONVERSATION_MESSAGES >= 1
+            num_history_messages_for_llm = 0
+
+
+        actual_history_llm_input_size = min(len(current_messages_from_state), num_history_messages_for_llm)
+        
+        history_for_llm_input: List[BaseMessage] = []
+        if actual_history_llm_input_size > 0:
+            history_for_llm_input = current_messages_from_state[-actual_history_llm_input_size:]
+            
+            if history_for_llm_input and isinstance(history_for_llm_input[0], ToolMessage):
+                orphaned_tool_msg = history_for_llm_input[0]
+                logger.warning(
+                    f"Orphaned ToolMessage (tool_call_id: {orphaned_tool_msg.tool_call_id}, "
+                    f"name: {getattr(orphaned_tool_msg, 'name', 'N/A')}) "
+                    f"would be the first history message in LLM input. Removing it."
+                )
+                history_for_llm_input = history_for_llm_input[1:]
+                        
+                if not history_for_llm_input and len(current_messages_from_state) > 1:
+                    logger.warning("history_for_llm_input became empty after removing orphaned ToolMessage. Taking last message from history as fallback.")
+                    history_for_llm_input = [current_messages_from_state[-1]]
+        
+        elif len(current_messages_from_state) > 0 and num_history_messages_for_llm == 0 :
+            # This case means max_conversation_messages might be 1.
+            # We still want to send the last user message if available.
+            logger.warning(
+                f"Calculated history LLM input size is 0 (max_messages={self.max_conversation_messages}). "
+                f"Sending the last message from state if available."
             )
-        )
-        logger.info("LLM Engine: System prompt created.")
-        return app, system_prompt
+            history_for_llm_input = [current_messages_from_state[-1]]
 
-    async def startup(self):
-        try:
-            self._get_store() 
-            self._app, self._system_prompt = self._get_app_and_prompt_internal()
-            logger.info("LangGraphLLMEngine started and app compiled.")
-        except Exception as e:
-            logger.error(f"LangGraphLLMEngine startup failed: {e}", exc_info=True)
-            raise
 
-    async def shutdown(self):
-        if self._store_cm:
-            logger.info("LLM Engine (shutdown): Closing PostgresStore connection...")
-            try:
-                self._store_cm.__exit__(None, None, None)
-            except Exception as e:
-                logger.error(f"LLM Engine (shutdown): Error closing PostgresStore: {e}", exc_info=True)
-            self._store = None; self._store_cm = None
-            logger.info("LLM Engine (shutdown): PostgresStore connection closed.")
+        # Prepend the system prompt
+        messages_for_llm_input = [SystemMessage(content=self.system_prompt_content)] + history_for_llm_input
         
-        if hasattr(self._get_app_and_prompt_internal, 'cache_clear'):
-            self._get_app_and_prompt_internal.cache_clear()
+        # --- Determine messages to remove from state (for overall history pruning) ---
+        if (len(current_messages_from_state) + 1) > self.max_conversation_messages: # +1 for the upcoming AI response
+            num_to_remove_from_state = (len(current_messages_from_state) + 1) - self.max_conversation_messages
+            if num_to_remove_from_state > 0:
+                messages_to_be_deleted = current_messages_from_state[:num_to_remove_from_state]
+                remove_message_ops = [
+                    RemoveMessage(id=m.id) for m in messages_to_be_deleted if hasattr(m, 'id') and m.id is not None
+                ]
+                messages_to_update_state.extend(remove_message_ops)
+                logger.debug(f"History Pruning: {len(remove_message_ops)} oldest messages marked for removal from state.")
         
-        self._app = None; self._system_prompt = None
-        self._llm = None; self._agent_model = None; self._tool_node = None
+        logger.debug(f"Invoking LLM with {len(messages_for_llm_input)} messages (incl. system prompt). History snippet: {[str(type(m)) + ': ' + str(m.content)[:70] + (' (tool_calls)' if isinstance(m, AIMessage) and m.tool_calls else '') + (f'(tool_id:{m.tool_call_id})' if isinstance(m, ToolMessage) else '') for m in history_for_llm_input]}")
+
+        if len(messages_for_llm_input) == 1 and isinstance(messages_for_llm_input[0], SystemMessage) and len(current_messages_from_state) == 0:
+            # This is the very first turn, only system prompt is sent.
+            # Some LLMs might expect a HumanMessage after SystemMessage.
+            # However, LangChain's ChatOpenAI should handle this.
+            # If issues arise, one might add a dummy HumanMessage or ensure `ask` always provides one.
+            # Current `ask` method always adds a HumanMessage to the state *before* this node is called,
+            # so `current_messages_from_state` will contain that HumanMessage, and `history_for_llm_input` won't be empty.
+            pass
+        elif not history_for_llm_input and len(current_messages_from_state) > 0:
+             logger.error("Critical: history_for_llm_input is empty, but current_messages_from_state was not. This indicates a logic flaw in history preparation.")
+             # As a last resort, send system prompt + last message from state
+             messages_for_llm_input = [SystemMessage(content=self.system_prompt_content), current_messages_from_state[-1]]
+        elif not history_for_llm_input and len(current_messages_from_state) == 0:
+            logger.warning("Chatbot node: history_for_llm_input is empty because current_messages_from_state is empty. Sending only system prompt.")
+            # messages_for_llm_input will just be [SystemMessage(...)]
+
+        response_message = self.llm_with_tools.invoke(messages_for_llm_input)
+        messages_to_update_state.append(response_message)
         
-        if hasattr(self._checkpointer, 'close') and callable(self._checkpointer.close):
-            try:
-                logger.info("LLM Engine (shutdown): Closing checkpointer...")
-                if asyncio.iscoroutinefunction(self._checkpointer.close): await self._checkpointer.close()
-                else: self._checkpointer.close()
-                logger.info("LLM Engine (shutdown): Checkpointer closed.")
-            except Exception as e:
-                logger.error(f"LLM Engine (shutdown): Error closing checkpointer: {e}", exc_info=True)
-        logger.info("LangGraphLLMEngine resources cleared/closed.")
+        return {"messages": messages_to_update_state}
 
     async def ask(self, question: str, thread_id: str, return_full: bool = False) -> Union[str, BaseMessage]:
-        if not self._app or not self._system_prompt:
-            logger.error("LLM Engine: App/System Prompt not initialized. Call startup() first.")
-            error_content = "Sorry, the language model is not available right now."
-            return AIMessage(content=error_content) if return_full else error_content
+        if not self.graph:
+            logger.error("LangGraph graph is not compiled. Cannot process 'ask' request.")
+            return "Error: LLM Engine is not properly initialized."
 
-        logger.info(f"LLM Engine: ask called for thread '{thread_id}'. Question: '{question[:50]}...'") # Renamed from ask_lumi
+        graph_config = {"configurable": {"thread_id": thread_id}}
+        
+        # Input for the graph: the new user question.
+        # This HumanMessage will be part of `current_messages_from_state` in `_chatbot_node_func`
+        input_data = {"messages": [HumanMessage(content=question)]}
+
+        logger.debug(f"Invoking LangGraph for thread_id='{thread_id}' with new question.")
+        
         try:
-            messages = [self._system_prompt, HumanMessage(content=question)]
-            config = {"configurable": {"thread_id": thread_id}}
-            final_event = None
-            async for event in self._app.astream( {"messages": messages}, config=config, stream_mode="values" ):
-                final_event = event
-
-            if final_event is None or not final_event.get("messages"):
-                logger.error(f"LLM Engine: Agent did not return any events/messages for thread '{thread_id}'.")
-                raise RuntimeError("Lumi (LLM Engine) did not return a valid response.")
-
-            final_msg = final_event["messages"][-1]
-            logger.info(f"LLM Engine: Lumi final response type for thread '{thread_id}': {type(final_msg).__name__}")
-
-            if hasattr(final_msg, 'tool_calls') and final_msg.tool_calls:
-                logger.error(f"LLM Engine: Agent ended with unhandled tool calls for thread '{thread_id}': {final_msg.tool_calls}")
-                content = "Sorry, I got stuck trying to use a tool."
-                return AIMessage(content=content) if return_full else content
-            
-            return final_msg if return_full else str(final_msg.content)
-
+            final_state_dict = await self.graph.ainvoke(input_data, graph_config)
         except Exception as e:
-            logger.error(f"LLM Engine: Error during ask execution for thread '{thread_id}': {e}", exc_info=True)
-            error_content = f"Sorry, an error occurred while processing your request with the AI model."
-            return AIMessage(content=error_content) if return_full else error_content
-# --- END OF FILE engines/llm_logic/langgraph_llm.py (Async _call_model) ---
+            logger.error(f"Error during LangGraph ainvoke for thread_id='{thread_id}': {e}", exc_info=True)
+            return f"Sorry, an error occurred while I was thinking: {str(e)}"
+
+        all_messages: List[BaseMessage] = final_state_dict.get("messages", [])
+        
+        last_ai_message: Optional[AIMessage] = None
+        for msg in reversed(all_messages):
+            if isinstance(msg, AIMessage):
+                last_ai_message = msg
+                break
+        
+        if last_ai_message:
+            logger.info(f"LLM response for thread_id='{thread_id}' successfully retrieved. Total messages in state: {len(all_messages)}.")
+            if return_full:
+                return last_ai_message
+            return last_ai_message.content
+        else:
+            logger.warning(f"No AIMessage found in the final state for thread_id='{thread_id}'. Full state messages: {all_messages}")
+            return "I'm sorry, I couldn't formulate a response."
+
+    async def startup(self):
+        logger.info("LangGraphLLMEngine startup: No specific actions needed for MemorySaver.")
+        pass
+
+    async def shutdown(self):
+        logger.info("LangGraphLLMEngine shutdown: No specific actions needed for MemorySaver.")
+        pass

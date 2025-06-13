@@ -25,7 +25,7 @@ class EngineSelectorSettings:
     stt_engine: str = os.getenv("STT_ENGINE", "vosk") # e.g., "vosk"
     tts_engine: str = os.getenv("TTS_ENGINE", "hybrid") # Default to hybrid
     # Names of specific implementations for online/offline roles if tts_engine is "hybrid"
-    tts_online_provider: str = os.getenv("TTS_ONLINE_PROVIDER", "gemini") # e.g., "gemini"
+    tts_online_provider: str = os.getenv("TTS_ONLINE_PROVIDER", "applio") # e.g., "gemini"
     tts_offline_provider: str = os.getenv("TTS_OFFLINE_PROVIDER", "paroli") # e.g., "paroli"
     nlu_engine: str = os.getenv("NLU_ENGINE", "rasa")   # e.g., "rasa"
     llm_logic_engine: str = os.getenv("LLM_LOGIC_ENGINE", "langgraph") # e.g., "langgraph"
@@ -41,6 +41,7 @@ class PicovoiceSettings:
     """Настройки Picovoice (Porcupine & Cobra)."""
     access_key: str = os.getenv("PICOVOICE_API_KEY", "YOUR_PICOVOICE_ACCESS_KEY_HERE")
     porcupine_keywords: List[str] = field(default_factory=lambda: ["picovoice"])
+    keyword_paths: List[str] = field(default_factory=lambda: ["./models/Lumia_en_raspberry-pi_v3_0_0.ppn"])
     # Optional: porcupine_model_path, porcupine_library_path
     # Optional: cobra_library_path
 
@@ -106,6 +107,26 @@ class GeminiTTSSettings:
 
 
 @dataclass(frozen=True)
+class ApplioTTSSettings:
+    """Настройки Applio RVC TTS. https://github.com/IAHispano/Applio"""
+    api_url: str = os.getenv("APPLIO_API_URL", "http://31.181.77.165:5566/synthesize")
+    # Path to the .pth model file, accessible by the Applio server
+    pth_path: Optional[str] = os.getenv("APPLIO_PTH_PATH")
+    # Path to the .index file, accessible by the Applio server (can be null/None)
+    index_path: Optional[str] = os.getenv("APPLIO_INDEX_PATH")
+    # Base voice model used by Applio, e.g., from EdgeTTS or other sources
+    edge_voice: str = os.getenv("APPLIO_EDGE_VOICE", "ru-RU-SvetlanaNeural") # Example from curl
+    pitch: int = int(os.getenv("APPLIO_PITCH", 2)) # Voice pitch adjustment
+    index_rate: float = float(os.getenv("APPLIO_INDEX_RATE", 0.1)) # Feature retrieval ratio for .index file
+    f0_method: str = os.getenv("APPLIO_F0_METHOD", "rmvpe") # Pitch estimation algorithm
+    export_format: str = os.getenv("APPLIO_EXPORT_FORMAT", "WAV") # Recommended: WAV for PCM-like data. Other: MP3, OGG etc.
+    # Expected sample rate of the output audio. Adjust if Applio model outputs differently.
+    # For WAV, this should match the WAV header's sample rate.
+    sample_rate: int = int(os.getenv("APPLIO_SAMPLE_RATE", 40000))
+    timeout_seconds: float = float(os.getenv("APPLIO_TIMEOUT_SECONDS", 30.0)) # Timeout for HTTP requests to Applio
+
+
+@dataclass(frozen=True)
 class AudioSettings:
     """Общие аудио-настройки."""
     sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", 16000))
@@ -136,6 +157,44 @@ class PostgresSettings:
 
 
 @dataclass(frozen=True)
+class Mem0Settings:
+    """Настройки для Mem0 (сервис памяти)."""
+    # Общие настройки
+    enabled: bool = os.getenv("MEM0_ENABLED", "True").lower() in ("true", "1", "t")
+    
+    # --- Ключи API ---
+    # Ключ для OpenRouter
+    openrouter_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+    openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
+    # Ключ для Gemini/Google (может понадобиться для эмбеддера)
+    gemini_api_key: Optional[str] = os.getenv("GEMINI_API_KEY")
+
+    # --- Настройки LLM для mem0 ---
+    # Модель указывается с префиксом, как в LiteLLM. 
+    # Например: "openrouter/meta-llama/llama-3.1-70b-instruct"
+    # или "gemini/gemini-1.5-pro"
+    llm_model: str = os.getenv("MEM0_LLM_MODEL", "openrouter/meta-llama/llama-3.1-70b-instruct")
+    
+    # --- Настройки Embedder для mem0 ---
+    # Провайдер эмбеддера (например, "gemini", "openai", "huggingface")
+    embedder_provider: str = os.getenv("MEM0_EMBEDDER_PROVIDER", "gemini")
+    # Модель эмбеддера
+    embedder_model: str = os.getenv("MEM0_EMBEDDER_MODEL", "models/text-embedding-004")
+    embedding_dims: int = int(os.getenv("MEM0_EMBEDDING_DIMS", 768))
+
+    # --- Настройки баз данных ---
+    # Настройки графовой БД (Neo4j)
+    neo4j_url: Optional[str] = os.getenv("NEO4J_URL", "neo4j://localhost:7687")
+    neo4j_user: Optional[str] = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_password: Optional[str] = os.getenv("NEO4J_PASSWORD")
+
+    # Настройки векторной БД (Qdrant)
+    qdrant_url: Optional[str] = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key: Optional[str] = os.getenv("QDRANT_API_KEY")
+    qdrant_collection_name: str = os.getenv("QDRANT_COLLECTION_NAME", "lumi_memory")
+
+
+@dataclass(frozen=True)
 class AISettings: # For LLM/LangGraph (Online)
     embedding_model: str = os.getenv("EMBED_MODEL", "google_vertexai:text-multilingual-embedding-002")
     embedding_dims: int = int(os.getenv("EMBED_DIMS", 768))
@@ -143,7 +202,8 @@ class AISettings: # For LLM/LangGraph (Online)
     temperature: float = float(os.getenv("TEMPERATURE", 0.0))
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    history_length: int = 10
+    history_length: int = int(os.getenv("AI_HISTORY_LENGTH", 10))
+    system_prompt: Optional[str] = os.getenv("AI_SYSTEM_PROMPT", "You are a helpful AI assistant.")
     online_mode: bool = os.getenv("AI_ONLINE_MODE", "True").lower() in ("true", "1", "t")
 
 
@@ -151,8 +211,8 @@ class AISettings: # For LLM/LangGraph (Online)
 class OllamaSettings: # For Offline LLM
     base_url: Optional[str] = os.getenv("OLLAMA_BASE_URL", "http://localhost:8082")
     model: Optional[str] = os.getenv("OLLAMA_MODEL", "qwen:1b") # Or your preferred model
-    temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", 0.8))
-    system_prompt: Optional[str] = os.getenv("OLLAMA_SYSTEM_PROMPT", "You are Lumi, an efficient AI voice assistant.")
+    temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", 0.7))
+    system_prompt: Optional[str] = os.getenv("OLLAMA_SYSTEM_PROMPT", "You are Lumi (female gender), an efficient AI voice assistant. Answer in voice AI format (without * and such).")
 
 
 @dataclass(frozen=True)
@@ -180,6 +240,16 @@ class SoundDeviceSettings: # For local audio I/O via sounddevice
     # Input sample rate and frame length will come from global AudioSettings
     # Output sample rate for TTS might be different, e.g., Paroli's default
     tts_output_sample_rate: int = int(os.getenv("LOCAL_AUDIO_TTS_OUTPUT_SAMPLE_RATE", 22050)) # Default to Paroli's PCM rate
+    _fixed_sr_env = os.getenv("LOCAL_AUDIO_FIXED_OUTPUT_SAMPLE_RATE")
+    fixed_output_sample_rate: Optional[int] = None
+    if _fixed_sr_env and _fixed_sr_env.strip(): # Check if set and not just whitespace
+        try:
+            fixed_output_sample_rate = int(_fixed_sr_env)
+        except ValueError:
+            logger.warning(
+                f"Invalid integer value for LOCAL_AUDIO_FIXED_OUTPUT_SAMPLE_RATE: '{_fixed_sr_env}'. "
+                "Fixed output sample rate mode will be disabled (engine will use incoming TTS sample rate or resample dynamically)."
+            )
 
 
 @dataclass(frozen=True)
@@ -202,8 +272,8 @@ class ToolsSettings:
     """Настройки инструментов."""
     weather_api_key: str = os.getenv("WEATHER_API_KEY", "YOUR_WEATHER_API_KEY_HERE")
     weather_api_url: str = os.getenv("WEATHER_API_URL", "https://api.openweathermap.org/data/2.5/weather")
-    jina_search_api_url: str = os.getenv("JINA_SEARCH_API_URL", "https://s.jina.ai/")
-    jina_search_api_key: str = os.getenv("JINA_SEARCH_API_KEY", "YOUR_JINA_SEARCH_API_KEY_HERE")
+    serper_api_url: str = os.getenv("SERPER_API_URL", "https://google.serper.dev/search")
+    serper_api_key: str = os.getenv("SERPER_API_KEY", "YOUR_SERPER_API_KEY_HERE")
 
 
 @dataclass(frozen=True)
@@ -260,6 +330,7 @@ class Settings:
     vosk: VoskSettings = field(default_factory=VoskSettings)
     paroli_server: ParoliServerSettings = field(default_factory=ParoliServerSettings)
     gemini_tts: GeminiTTSSettings = field(default_factory=GeminiTTSSettings) # Added Gemini TTS settings
+    applio_tts: ApplioTTSSettings = field(default_factory=ApplioTTSSettings)
     audio: AudioSettings = field(default_factory=AudioSettings)
     webapp: WebAppSettings = field(default_factory=WebAppSettings)
     postgres: PostgresSettings = field(default_factory=PostgresSettings)
@@ -275,6 +346,7 @@ class Settings:
     scheduler_check_interval_seconds: int = int(os.getenv("SCHEDULER_CHECK_INTERVAL_SECONDS", 30)) # How often to check for due reminders
     smtp_mail: SMTPMailSettings = field(default_factory=SMTPMailSettings)
     contacts_config: ContactSettings = field(default_factory=ContactSettings)
+    mem0: Mem0Settings = field(default_factory=Mem0Settings)
 
 
 settings = Settings()

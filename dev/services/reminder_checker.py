@@ -52,29 +52,40 @@ async def check_and_process_reminders_periodically(tts_engine_ref, audio_output_
                         if audio_output_engine_ref.is_running: # Double check
                             
                             # --- ИЗМЕНЕНИЕ НАЧАЛО ---
-                            actual_sample_rate = settings.sounddevice.tts_output_sample_rate # Используем из настроек sounddevice как fallback
-                            active_tts_sub_engine = None
-                            if hasattr(tts_engine_ref, 'get_active_engine_for_synthesis'): # Проверяем, что это HybridTTS
-                                active_tts_sub_engine = await tts_engine_ref.get_active_engine_for_synthesis()
+                            # Determine the engine that will actually perform the synthesis
+                            engine_for_synthesis = tts_engine_ref
+                            resolved_engine_name = type(tts_engine_ref).__name__
+                            actual_sample_rate = settings.sounddevice.tts_output_sample_rate # Default fallback
+
+                            if hasattr(tts_engine_ref, 'get_active_engine_for_synthesis'): # It's a HybridEngine
+                                # This call resolves which sub-engine (online/offline) HybridTTS will use
+                                active_sub_engine = await tts_engine_ref.get_active_engine_for_synthesis()
+                                if active_sub_engine:
+                                    engine_for_synthesis = active_sub_engine # This is the engine that will actually synthesize
+                                    resolved_engine_name = f"HybridTTS -> {type(active_sub_engine).__name__}"
+                                    logger.info(f"Reminder ID {reminder_id}: Hybrid TTS selected sub-engine: {type(active_sub_engine).__name__}")
+                                else:
+                                    # Hybrid couldn't find an active sub-engine.
+                                    # Synthesis will likely use HybridEngine's own synthesize_stream (which might yield nothing or error).
+                                    # Sample rate will be attempted from HybridEngine itself (if it has get_output_sample_rate) or default.
+                                    logger.warning(f"Reminder ID {reminder_id}: Hybrid TTS could not select an active sub-engine. Using HybridEngine directly or fallback for SR. Synthesis may fail.")
+                                    # engine_for_synthesis remains tts_engine_ref (the HybridEngine instance)
                             
-                            if active_tts_sub_engine:
+                            # Get the sample rate from the chosen engine (either original or resolved sub-engine)
+                            if hasattr(engine_for_synthesis, 'get_output_sample_rate'):
                                 try:
-                                    actual_sample_rate = active_tts_sub_engine.get_output_sample_rate()
-                                    logger.info(f"Using sample rate {actual_sample_rate}Hz from active TTS sub-engine for reminder ID {reminder_id}.")
+                                    actual_sample_rate = engine_for_synthesis.get_output_sample_rate()
+                                    logger.info(f"Reminder ID {reminder_id}: Using sample rate {actual_sample_rate}Hz from {resolved_engine_name}.")
                                 except Exception as e_sr:
-                                    logger.warning(f"Could not get sample rate from active TTS sub-engine for reminder ID {reminder_id}: {e_sr}. Falling back to {actual_sample_rate}Hz.")
-                            elif hasattr(tts_engine_ref, 'get_output_sample_rate'): # Если это не гибридный, но имеет метод
-                                try:
-                                    actual_sample_rate = tts_engine_ref.get_output_sample_rate()
-                                    logger.info(f"Using sample rate {actual_sample_rate}Hz from TTS engine for reminder ID {reminder_id}.")
-                                except Exception as e_sr:
-                                     logger.warning(f"Could not get sample rate from TTS engine for reminder ID {reminder_id}: {e_sr}. Falling back to {actual_sample_rate}Hz.")
+                                    logger.warning(f"Reminder ID {reminder_id}: Could not get sample rate from {resolved_engine_name}: {e_sr}. Falling back to default SR {actual_sample_rate}Hz.")
                             else:
-                                logger.warning(f"TTS engine type does not support dynamic sample rate retrieval for reminder ID {reminder_id}. Using default sample rate {actual_sample_rate}Hz.")
+                                logger.warning(f"Reminder ID {reminder_id}: Engine {resolved_engine_name} does not have get_output_sample_rate method. Using default SR {actual_sample_rate}Hz.")
                             # --- ИЗМЕНЕНИЕ КОНЕЦ ---
 
+                            # Synthesize using the determined engine_for_synthesis
                             tts_audio_bytes = bytearray()
-                            async for chunk in tts_engine_ref.synthesize_stream(full_announcement):
+                            logger.info(f"Reminder ID {reminder_id}: Synthesizing with {resolved_engine_name} using announcement: '{full_announcement}'")
+                            async for chunk in engine_for_synthesis.synthesize_stream(full_announcement):
                                 tts_audio_bytes.extend(chunk)
                             
                             if tts_audio_bytes:
@@ -82,7 +93,7 @@ async def check_and_process_reminders_periodically(tts_engine_ref, audio_output_
                                 # --- ИЗМЕНЕНИЕ: передаем actual_sample_rate ---
                                 audio_output_engine_ref.play_tts_bytes(bytes(tts_audio_bytes), sample_rate=actual_sample_rate)
                             else:
-                                logger.warning(f"TTS produced no audio for reminder ID {reminder_id}.")
+                                logger.warning(f"TTS ({resolved_engine_name}) produced no audio for reminder ID {reminder_id}.")
                         else:
                             logger.warning(f"Audio output engine could not be started for reminder ID {reminder_id}.")
 

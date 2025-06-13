@@ -3,44 +3,51 @@ import json
 from typing import Dict, Any, Optional
 
 from .base import OfflineCommandProcessorBase
-from engines.communication.base import CommunicationServiceBase 
-from utils.text_processing import find_best_match, _normalize_russian_text_with_pymorphy # Removed unused imports
-from tools.time import get_current_time
-from tools.device_control import set_device_attribute_directly
+from engines.communication.base import CommunicationServiceBase # For type hint
+
+# Import helpers (assume they are in a utils module or accessible from offline_controller)
+# Ensure offline_controller.py is in a location where it can be imported,
+# or move these utilities to a proper utils.py file.
+from utils.text_processing import find_best_match, _normalize_russian_text_with_pymorphy, \
+                                  _PRE_NORMALIZED_CITY_TO_TIMEZONE, _NLU_ATTR_TO_STANDARD, \
+                                  initialize_city_timezones, morph, COLOR_NAME_TO_XY, \
+                                  COLOR_TEMP_PRESETS, normalize_text_key # (NEW)
+
+# Import tool functions that can be called directly
+from tools.time import get_current_time # Langchain tool, can be invoked
+from tools.device_control import set_device_attribute_directly # Assumed helper for direct MQTT calls
 
 logger = logging.getLogger(__name__)
 
-# Pymorphy and city timezones should be initialized by RasaNLUEngine or a central app setup.
-# If this module can be run independently, keep the initialization here as a fallback.
-# from utils.text_processing import initialize_city_timezones, morph
-# if morph is None:
-#     try:
-#         import pymorphy3
-#         morph = pymorphy3.MorphAnalyzer()
-#         logger.info("Pymorphy3 MorphAnalyzer initialized by DefaultOfflineCommandProcessor (fallback).")
-#     except Exception as e:
-#         logger.error(f"Failed to initialize Pymorphy3 in DefaultOfflineCommandProcessor (fallback): {e}")
-#         morph = None
-# initialize_city_timezones()
+# Ensure Pymorphy and city timezones are initialized if not already
+# This is redundant if rasa_nlu.py already does it, but safe.
+if morph is None:
+    try:
+        import pymorphy3
+        morph = pymorphy3.MorphAnalyzer()
+        logger.info("Pymorphy3 MorphAnalyzer initialized by DefaultOfflineCommandProcessor.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Pymorphy3 in DefaultOfflineCommandProcessor: {e}")
+        morph = None
+initialize_city_timezones()
 
 
 class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
     def __init__(self, comm_service: CommunicationServiceBase):
         self.comm_service = comm_service
-        if not comm_service:
-            logger.error("DefaultOfflineCommandProcessor initialized without a CommunicationService!")
 
     async def process_nlu_result(self, nlu_result: Dict[str, Any],
                                  last_mentioned_device_context: Optional[str]
-                                 ) -> Dict[str, Any]:
+                                 ) -> Dict[str, Any]: # Returns a "resolved_command" structure
         intent = nlu_result.get("intent")
         
+        # Base structure for the resolved command
         resolved_command = {
             "executable": False,
             "intent": intent,
-            "nlu_raw_output": nlu_result,
-            "response_on_failure": "Простите, я не смогла полностью понять или обработать вашу команду в оффлайн режиме.",
-            "resolved_device_name_for_context_update": None # Initialize here
+            "nlu_raw_output": nlu_result, # Store the raw NLU output for debugging/potential use
+            "response_on_failure": "Простите, я не смогла полностью понять или обработать вашу команду в оффлайн режиме."
+            # "resolved_device_name_for_context_update": None # Will be set if device is resolved
         }
 
         if not intent:
@@ -49,53 +56,56 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
 
         # --- GET_TIME INTENT ---
         if intent == "get_time":
-            timezone_arg = nlu_result.get("timezone_str_for_tool") # NLU provides this
+            # NLU engine already extracts 'timezone_str_for_tool'
+            timezone_arg = nlu_result.get("timezone_str_for_tool")
             resolved_command.update({
                 "executable": True,
                 "tool_to_call": "get_current_time_tool_invoke",
                 "tool_args": {"timezone_str": timezone_arg}
-                # No device context update for get_time
             })
             return resolved_command
 
         # --- DEVICE CONTROL INTENTS ---
         elif intent in ["activate_device", "deactivate_device", "set_attribute"]:
+            # These entities are provided by RasaNLUEngine based on its parsing:
+            # - device_description_text: Combined text for device description + location.
+            # - device_is_pronoun: Boolean indicating if a device pronoun was used.
+            # - attribute: Standardized attribute name (e.g., "brightness", "state").
+            # - raw_value: Normalized value for the attribute.
+            
             device_description_from_nlu = nlu_result.get("device_description_text")
             is_pronoun = nlu_result.get("device_is_pronoun", False)
             
             resolved_device_name: Optional[str] = None
-            
-            if not self.comm_service or not self.comm_service.is_connected:
-                resolved_command["response_on_failure"] = "Сервис управления устройствами недоступен, не могу обработать команду."
-                return resolved_command
-
             available_devices = self.comm_service.get_device_friendly_names()
+
             if not available_devices:
                 resolved_command["response_on_failure"] = "Я не вижу доступных устройств для управления."
                 return resolved_command
 
+            # Determine the text to use for fuzzy matching
             search_text_for_matching = None
             if is_pronoun and last_mentioned_device_context:
+                # If NLU said it's a pronoun AND we have a context device, use the context.
                 search_text_for_matching = last_mentioned_device_context
-                logger.debug(f"Offline Processor: Pronoun used. Using context '{search_text_for_matching}' for device search.")
+                logger.debug(f"Offline Processor: Pronoun indicated by NLU. Using context '{search_text_for_matching}' for device search.")
             elif device_description_from_nlu:
+                # If NLU provided a description, use that.
                 search_text_for_matching = device_description_from_nlu
-                logger.debug(f"Offline Processor: Using NLU device description '{search_text_for_matching}'.")
             elif intent in ['set_attribute', 'activate_device', 'deactivate_device'] and last_mentioned_device_context:
-                # Fallback: Device control intent, no specific device in NLU, but context exists.
+                # Fallback: No specific device mentioned by NLU, but it's a device control intent, and we have context.
                 search_text_for_matching = last_mentioned_device_context
-                logger.debug(f"Offline Processor: No device in NLU for device intent. Using context '{search_text_for_matching}'.")
-            
+                logger.debug(f"Offline Processor: No device in NLU, but device intent. Using context '{search_text_for_matching}'.")
+
+
             if search_text_for_matching:
+                # Normalize the search text before fuzzy matching
                 normalized_search_text = _normalize_russian_text_with_pymorphy(search_text_for_matching)
-                if normalized_search_text:
-                    # Use a slightly higher cutoff for offline processing to be more certain
-                    matched_device_info = find_best_match(normalized_search_text, available_devices, score_cutoff=75, return_match_info=True)
-                    if matched_device_info:
-                        resolved_device_name = matched_device_info["match"]
-                        logger.info(f"Offline Processor: Device resolved via search '{search_text_for_matching}' (norm: '{normalized_search_text}') to '{resolved_device_name}' with score {matched_device_info['score']}.")
-                        # IMPORTANT: Update context field as soon as device is resolved
-                        resolved_command["resolved_device_name_for_context_update"] = resolved_device_name
+                if normalized_search_text: # Ensure not empty after normalization
+                    matched_device = find_best_match(normalized_search_text, available_devices, score_cutoff=70)
+                    if matched_device:
+                        resolved_device_name = matched_device
+                        logger.info(f"Offline Processor: Device resolved via search '{search_text_for_matching}' (norm: '{normalized_search_text}') to '{resolved_device_name}'")
                 else:
                     logger.warning(f"Offline Processor: Search text '{search_text_for_matching}' became empty after normalization.")
             
@@ -103,24 +113,22 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
                 original_search_ref = device_description_from_nlu or \
                                       (last_mentioned_device_context if is_pronoun or not device_description_from_nlu else "не указанное устройство")
                 resolved_command["response_on_failure"] = f"Я не уверена, какое устройство вы имеете в виду, говоря '{original_search_ref}'."
-                # Do not clear resolved_device_name_for_context_update if it was set by a previous, more specific match attempt
-                # that failed a later validation. However, in this path, it means no device was found at all.
                 return resolved_command
 
-            # Attribute and Value are already processed and standardized by RasaNLUEngine
-            attribute_name = nlu_result.get("attribute") 
-            raw_value_from_nlu = nlu_result.get("raw_value")
+            # Attribute and Value are already processed by RasaNLUEngine
+            attribute_name = nlu_result.get("attribute") # Already standardized by NLU engine
+            raw_value_from_nlu = nlu_result.get("raw_value") # Already normalized by NLU engine
 
-            if not attribute_name:
+            if not attribute_name: # Should be set by NLU for these intents
                 resolved_command["response_on_failure"] = f"Я поняла, что речь о устройстве '{resolved_device_name}', но не поняла, что именно нужно изменить."
                 return resolved_command
-            if raw_value_from_nlu is None and intent == "set_attribute":
+            if raw_value_from_nlu is None and intent == "set_attribute": # Value needed for set_attribute
                 resolved_command["response_on_failure"] = f"Для устройства '{resolved_device_name}', мне нужно знать, какое значение установить для '{attribute_name}'."
                 return resolved_command
 
             resolved_command.update({
                 "executable": True,
-                "device_friendly_name": resolved_device_name,
+                "device_friendly_name": resolved_device_name, # This is the resolved name
                 "attribute_name": attribute_name,
                 "value_str": str(raw_value_from_nlu), # Tool expects string
                 "tool_to_call": "set_device_attribute_directly",
@@ -128,8 +136,8 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
                     "device_friendly_name": resolved_device_name,
                     "attribute_name": attribute_name,
                     "value_str": str(raw_value_from_nlu)
-                }
-                # resolved_device_name_for_context_update is already set if device was found
+                },
+                "resolved_device_name_for_context_update": resolved_device_name # IMPORTANT FOR CONTEXT
             })
             return resolved_command
         else:
@@ -137,6 +145,7 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
             return resolved_command
 
     async def execute_resolved_command(self, resolved_command: Dict[str, Any]) -> str:
+        # ... (this method remains largely the same as previously defined) ...
         if not resolved_command.get("executable"):
             return resolved_command.get("response_on_failure", "Команду не удалось выполнить.")
 
@@ -147,14 +156,10 @@ class DefaultOfflineCommandProcessor(OfflineCommandProcessorBase):
 
         try:
             if tool_to_call == "get_current_time_tool_invoke":
-                # Ensure get_current_time.invoke can handle if timezone_str is None
                 return get_current_time.invoke(tool_args) 
             elif tool_to_call == "set_device_attribute_directly":
-                if not self.comm_service:
-                     logger.error("Offline Processor: CommunicationService not available for set_device_attribute_directly.")
-                     return "Ошибка: Сервис управления устройствами не доступен."
                 return await set_device_attribute_directly(
-                    comm_service=self.comm_service, # Pass the instance
+                    comm_service=self.comm_service,
                     **tool_args
                 )
             else:

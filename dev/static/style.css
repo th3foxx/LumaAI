@@ -1,0 +1,214 @@
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start; 
+    min-height: 100vh;
+    margin: 0;
+    padding-top: 20px; 
+    padding-bottom: 20px; /* Добавим отступ снизу для прокрутки */
+    background-color: #f0f2f5;
+    color: #333;
+    box-sizing: border-box;
+}
+
+.container {
+    background-color: white;
+    padding: 30px; /* Немного больше отступов */
+    border-radius: 16px; /* Более скругленные углы */
+    box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+    text-align: center;
+    width: 90%;
+    max-width: 550px; /* Немного шире для визуализатора */
+}
+
+h1 {
+    color: #1a73e8;
+    margin-bottom: 20px; /* Уменьшен отступ */
+    font-size: 2.2em; /* Крупнее заголовок */
+}
+
+/* Стили Визуализатора Голоса */
+#voice-visualizer-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 160px; /* Высота контейнера визуализатора */
+    margin-bottom: 25px;
+    position: relative;
+}
+
+#voice-visualizer {
+    width: 100px; /* Базовый размер */
+    height: 100px;
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+#visualizer-core {
+    width: 50px; /* Ядро */
+    height: 50px;
+    background-color: #7baaf7; /* Мягкий синий для состояния покоя */
+    border-radius: 50%;
+    position: absolute;
+    transform: scale(0.8); /* Начальный масштаб для состояния покоя */
+    transition: transform 0.3s ease-out, background-color 0.3s ease, box-shadow 0.3s ease;
+    box-shadow: 0 0 10px rgba(123, 170, 247, 0.4); /* Мягкая тень */
+}
+
+.visualizer-ring {
+    position: absolute;
+    border: 2px solid #7baaf7; /* Цвет колец в состоянии покоя */
+    border-radius: 50%;
+    opacity: 0; /* Кольца невидимы по умолчанию */
+    transform: scale(0.5);
+    transition: border-color 0.3s ease;
+}
+
+/* Состояние IDLE (покоя) - базовые стили выше + класс .idle */
+#voice-visualizer.idle #visualizer-core {
+    /* Можно добавить очень медленную анимацию "дыхания" здесь, если нужно */
+}
+#voice-visualizer.idle .visualizer-ring {
+    opacity: 0; /* Убедимся, что кольца скрыты */
+}
+
+
+/* Состояние LISTENING (Пользователь говорит, Lumi слушает) */
+@keyframes listeningPulseCore {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 15px rgba(26, 115, 232, 0.5); }
+    50% { transform: scale(1.1); box-shadow: 0 0 25px rgba(26, 115, 232, 0.7); }
+}
+@keyframes listeningRingExpand {
+    0% { transform: scale(0.6); opacity: 0.8; }
+    100% { transform: scale(1.8); opacity: 0; }
+}
+
+#voice-visualizer.listening #visualizer-core {
+    animation: listeningPulseCore 1.5s infinite ease-in-out;
+    background-color: #1a73e8; /* Активный синий */
+    transform: scale(1); /* Сброс масштаба перед анимацией */
+}
+#voice-visualizer.listening .visualizer-ring {
+    border-color: #1a73e8;
+}
+#voice-visualizer.listening .visualizer-ring:nth-child(1) {
+    width: 90px; height: 90px;
+    animation: listeningRingExpand 2s infinite ease-out;
+    animation-delay: 0s;
+}
+#voice-visualizer.listening .visualizer-ring:nth-child(2) {
+    width: 90px; height: 90px;
+    animation: listeningRingExpand 2s infinite ease-out;
+    animation-delay: 0.7s;
+}
+#voice-visualizer.listening .visualizer-ring:nth-child(3) {
+    display: none; /* Меньше колец для состояния слушания */
+}
+
+
+/* Состояние SPEAKING (Lumi говорит TTS) */
+@keyframes speakingPulseCore {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 20px rgba(13, 190, 115, 0.6); }
+    50% { transform: scale(1.25); box-shadow: 0 0 35px rgba(13, 190, 115, 0.8); }
+}
+@keyframes speakingRingExpand {
+    0% { transform: scale(0.5); opacity: 1; }
+    100% { transform: scale(2.5); opacity: 0; } /* Кольца расширяются шире */
+}
+
+#voice-visualizer.speaking #visualizer-core {
+    animation: speakingPulseCore 1.2s infinite ease-in-out;
+    background-color: #0DBE73; /* Зеленый цвет для речи */
+    transform: scale(1); /* Сброс масштаба */
+}
+#voice-visualizer.speaking .visualizer-ring {
+    border-color: #0DBE73;
+    display: block; /* Убедимся, что все кольца видны */
+}
+#voice-visualizer.speaking .visualizer-ring:nth-child(1) {
+    width: 100px; height: 100px;
+    animation: speakingRingExpand 1.8s infinite ease-out;
+    animation-delay: 0s;
+}
+#voice-visualizer.speaking .visualizer-ring:nth-child(2) {
+    width: 100px; height: 100px;
+    animation: speakingRingExpand 1.8s infinite ease-out;
+    animation-delay: 0.6s;
+}
+#voice-visualizer.speaking .visualizer-ring:nth-child(3) {
+    width: 100px; height: 100px;
+    animation: speakingRingExpand 1.8s infinite ease-out;
+    animation-delay: 1.2s;
+}
+
+
+/* Элементы управления и статус */
+#controls button {
+    padding: 12px 20px;
+    margin: 8px 8px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    background-color: #1a73e8;
+    color: white;
+    font-size: 1.05em; /* Немного крупнее шрифт кнопок */
+    transition: background-color 0.2s, transform 0.1s;
+}
+#controls button:hover:not(:disabled) {
+    background-color: #1558b3;
+    transform: translateY(-1px); /* Небольшой эффект при наведении */
+}
+#controls button:active:not(:disabled) {
+    transform: translateY(0px); /* Эффект нажатия */
+}
+#controls button:disabled {
+    background-color: #d1d1d1;
+    cursor: not-allowed;
+    color: #777;
+}
+
+#status {
+    margin-top: 10px; /* Уменьшен отступ */
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 500;
+    min-height: 25px;
+    color: #5f6368;
+}
+
+#transcript-container {
+    margin-top: 20px;
+    text-align: left;
+    background-color: #f8f9fa;
+    padding: 20px; /* Больше отступов */
+    border-radius: 8px;
+    border: 1px solid #e0e0e0;
+    min-height: 80px;
+    max-height: 220px; /* Немного выше */
+    overflow-y: auto;
+}
+#transcript-container h2 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    font-size: 1.05em; /* Немного крупнее */
+    color: #3c4043;
+}
+#transcript, .partial {
+    word-wrap: break-word;
+    font-size: 1em; /* Крупнее текст транскрипции */
+    line-height: 1.5;
+}
+.partial {
+    color: #777;
+    font-style: italic;
+}
+
+.error {
+    margin-top: 15px;
+    color: #d93025;
+    font-weight: 500;
+    min-height: 20px;
+}

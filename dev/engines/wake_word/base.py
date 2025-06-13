@@ -3,7 +3,7 @@ from typing import List
 
 class WakeWordEngineBase(ABC):
     @abstractmethod
-    def __init__(self, access_key: str, keywords: List[str], sensitivities: List[float] = None, **kwargs):
+    def __init__(self, access_key: str, keyword_paths: List[str], keywords: List[str] = None, sensitivities: List[float] = None, **kwargs):
         pass
 
     @abstractmethod

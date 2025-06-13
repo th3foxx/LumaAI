@@ -4,29 +4,39 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lumi Voice Assistant</title>
-    <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; background-color: #f0f0f0; }
-        #status { margin-top: 20px; font-size: 1.2em; padding: 10px 20px; border-radius: 5px; background-color: #ddd; min-width: 250px; text-align: center; }
-        #transcript { margin-top: 15px; font-style: italic; color: #555; min-height: 2em; }
-        .status-wakeword { background-color: #e0e0ff; }
-        .status-listening { background-color: #ffdddd; animation: pulse 1.5s infinite; }
-        .status-processing { background-color: #ffffcc; }
-        .status-speaking { background-color: #ddffdd; }
-        .status-error { background-color: #ffaaaa; color: #a00; }
-
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(255, 100, 100, 0.7); }
-            70% { box-shadow: 0 0 0 10px rgba(255, 100, 100, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(255, 100, 100, 0); }
-        }
-    </style>
+    <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <h1>Lumi Voice Assistant</h1>
-    <div id="status" class="status-connecting">Connecting...</div>
-    <div id="transcript"></div>
-    <div id="error" style="color: red; margin-top: 10px;"></div>
+    <div class="container">
+        <h1>Lumi Voice Assistant</h1>
 
+        <div id="voice-visualizer-container">
+            <div id="voice-visualizer" class="idle"> <!-- Начальное состояние "idle" -->
+                <div class="visualizer-ring"></div>
+                <div class="visualizer-ring"></div>
+                <div class="visualizer-ring"></div>
+                <div id="visualizer-core"></div>
+            </div>
+        </div>
+
+        <div id="status">Status: Disconnected</div>
+        
+        <div id="controls">
+            <button id="connectButton">Connect</button>
+            <button id="startButton" disabled>Start Listening</button> <!-- Изменен текст -->
+            <button id="stopButton" disabled>Stop Listening</button>   <!-- Изменен текст -->
+        </div>
+
+        <div id="transcript-container">
+            <h2>Transcript:</h2>
+            <div id="transcript"></div>
+            <div id="partial-transcript" class="partial"></div>
+        </div>
+        <div id="error-log" class="error"></div>
+
+        <audio id="activationSound" src="/static/sounds/activation.wav" preload="auto"></audio>
+        <!-- Убедитесь, что activation.wav находится в папке static -->
+    </div>
     <script src="/static/script.js"></script>
 </body>
 </html>

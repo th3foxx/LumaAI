@@ -1,5 +1,5 @@
 import os
-import httpx # <--- Use httpx
+import httpx
 import logging
 from datetime import datetime
 from typing import Optional
@@ -21,8 +21,14 @@ if not OPENWEATHERMAP_API_KEY:
 @tool
 async def get_current_weather(location: str, units: Optional[str] = "metric") -> str: # <--- Made async
     """
-    Gets the current weather for the specified location using an asynchronous HTTP request.
-    (Docstring remains similar)
+    Gets the current weather for the specified location.
+    The location name (city) MUST be in the nominative case (e.g., 'Москва', 'Ейск', 'Лондон').
+    You can also specify the country code after a comma (e.g., 'Moscow, RU', 'London, UK', 'Tokyo, JP').
+
+    Parameters:
+        location (str): City name (in nominative case) and optionally country code.
+                        Examples: 'Ейск', 'Санкт-Петербург', 'London, UK'.
+        units (str, optional): Units of measurement. 'metric' for Celsius, 'imperial' for Fahrenheit. Default 'metric'.
     """
     if not OPENWEATHERMAP_API_KEY:
         logger.error("API ключ для OpenWeatherMap не настроен.")
@@ -42,13 +48,12 @@ async def get_current_weather(location: str, units: Optional[str] = "metric") ->
 
     try:
         logger.info(f"Асинхронный запрос погоды для {location} с параметрами: {params}")
-        async with httpx.AsyncClient(timeout=10.0) as client: # <--- Async client and timeout
-            response = await client.get(OPENWEATHERMAP_API_URL, params=params) # <--- await client.get
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(OPENWEATHERMAP_API_URL, params=params)
             response.raise_for_status() 
             data = response.json()
         logger.debug(f"Ответ от API погоды: {data}")
 
-        # ... (rest of the data parsing and string formatting logic remains the same)
         main = data.get("main", {})
         weather_desc_list = data.get("weather", [{}])
         weather_desc = weather_desc_list[0].get("description", "нет данных") if weather_desc_list else "нет данных"
@@ -74,7 +79,7 @@ async def get_current_weather(location: str, units: Optional[str] = "metric") ->
             f"- Скорость ветра: {wind_speed} {speed_unit}"
         )
 
-    except httpx.HTTPStatusError as e: # <--- Catch httpx specific error
+    except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             logger.error("Ошибка авторизации с API OpenWeatherMap. Проверьте API ключ.")
             return "Ошибка: Недействительный API ключ для сервиса погоды."

@@ -1,108 +1,93 @@
-const AUDIO_FRAME_LENGTH = 512; // Must match the main script's setting
-const TARGET_SAMPLE_RATE = 16000; // Must match the main script's setting
+// static/audio-processor.js
 
-class AudioRecorderProcessor extends AudioWorkletProcessor {
+class AudioStreamProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
-        // We expect sampleRate to be passed from the main thread if needed,
-        // but typically the context's sampleRate is used implicitly.
-        // Check if the actual sample rate matches the target.
-        // Note: `sampleRate` is a global variable in AudioWorkletGlobalScope
-        if (sampleRate !== TARGET_SAMPLE_RATE) {
-            console.warn(`[AudioWorklet] Warning: AudioContext running at ${sampleRate}Hz, target is ${TARGET_SAMPLE_RATE}Hz. Ensure resampling is handled if necessary.`);
-            // Ideally, resampling would happen here if needed, but it adds complexity.
-            // For now, we assume the input stream is already at TARGET_SAMPLE_RATE
-            // due to the constraints passed to getUserMedia and the AudioContext constructor.
-        }
-
-        this._buffer = new Float32Array(TARGET_SAMPLE_RATE); // Buffer up to 1 second of audio
+        // sampleRate is a global variable in AudioWorkletGlobalScope (the AudioContext's sampleRate)
+        this.inputSampleRate = sampleRate; 
+        this.targetSampleRate = options.processorOptions.targetSampleRate || 16000;
+        this.frameLength = options.processorOptions.frameLength || 512;
+        
+        this._buffer = new Float32Array(this.frameLength * 2); // Internal buffer
         this._bufferPos = 0;
-        this._isRecording = false; // Controlled by messages from the main thread
 
-        this.port.onmessage = (event) => {
-            if (event.data.command === 'start') {
-                console.log('[AudioWorklet] Recording started.');
-                this._isRecording = true;
-                this._bufferPos = 0; // Reset buffer on start
-            } else if (event.data.command === 'stop') {
-                console.log('[AudioWorklet] Recording stopped.');
-                this._isRecording = false;
-                // Optionally process any remaining buffered data on stop?
-                // this.processRemainingBuffer();
-            }
-        };
+        // Basic resampling: if input SR is different from target SR, we need to handle it.
+        // This worklet assumes the AudioContext is already running at targetSampleRate,
+        // or that minor differences are handled by this very simple resampler.
+        // A robust solution would involve a proper resampling library if significant SR differences occur.
+        this.resampleStep = this.inputSampleRate / this.targetSampleRate;
+        this.resampleRemainder = 0; // For fractional step resampling
+
+        if (this.inputSampleRate !== this.targetSampleRate) {
+            this.port.postMessage({ type: 'debug', message: `AudioWorklet: Input SR ${this.inputSampleRate}, Target SR ${this.targetSampleRate}. Resample step: ${this.resampleStep.toFixed(2)}` });
+        } else {
+            this.port.postMessage({ type: 'debug', message: `AudioWorklet: Input SR ${this.inputSampleRate} matches Target SR ${this.targetSampleRate}.` });
+        }
     }
 
-    // process() is called whenever a new block of audio data is available.
-    // The block size is typically 128 frames, but can vary.
     process(inputs, outputs, parameters) {
-        // inputs[0] refers to the first input source.
-        // inputs[0][0] refers to the first channel of the first input source.
-        // It's a Float32Array containing the audio samples for this block.
-        const inputChannelData = inputs[0][0];
+        const inputChannelData = inputs[0]?.[0]; // First channel of the first input
 
-        // If not recording, or if there's no input data (silence detection?), exit early.
-        // Keep the worklet running by returning true.
-        if (!this._isRecording || !inputChannelData) {
+        if (!inputChannelData || inputChannelData.length === 0) {
             return true; // Keep processor alive
         }
+        
+        let currentInputSamples = inputChannelData;
 
-        // Append new data to the internal buffer
-        const availableSpace = this._buffer.length - this._bufferPos;
-        const dataToCopy = Math.min(inputChannelData.length, availableSpace);
-        if (dataToCopy < inputChannelData.length) {
-            console.warn('[AudioWorklet] Buffer overflow, dropping audio data!');
-            // Handle overflow: either drop old data or new data. Dropping new is simpler here.
-            // A larger buffer or faster processing might be needed.
-        }
-        if (dataToCopy > 0) {
-             this._buffer.set(inputChannelData.subarray(0, dataToCopy), this._bufferPos);
-             this._bufferPos += dataToCopy;
-        }
-
-
-        // Process the buffer in chunks of AUDIO_FRAME_LENGTH
-        while (this._bufferPos >= AUDIO_FRAME_LENGTH) {
-            // Extract a frame
-            const frame = this._buffer.slice(0, AUDIO_FRAME_LENGTH);
-
-            // Convert Float32 to Int16 PCM
-            const pcm16 = new Int16Array(AUDIO_FRAME_LENGTH);
-            for (let j = 0; j < AUDIO_FRAME_LENGTH; j++) {
-                // Clamp and scale
-                pcm16[j] = Math.max(-32768, Math.min(32767, Math.floor(frame[j] * 32767)));
+        // Simplified resampling: Process input samples to fit into our internal buffer
+        // This is a very basic approach (nearest neighbor or skipping/duplicating based on ratio)
+        // and not ideal for audio quality if sample rates differ significantly.
+        // The primary expectation is that AudioContext runs at targetSampleRate.
+        if (this.inputSampleRate !== this.targetSampleRate) {
+            const resampled = [];
+            this.resampleRemainder += currentInputSamples.length;
+            while (this.resampleRemainder >= this.resampleStep) {
+                // Calculate the approximate original index
+                // This is a simplification; proper resampling is complex.
+                const originalIndex = Math.floor((currentInputSamples.length - this.resampleRemainder) / this.resampleStep * (currentInputSamples.length / this.resampleStep));
+                resampled.push(currentInputSamples[Math.min(Math.max(0, originalIndex), currentInputSamples.length - 1)] || 0);
+                this.resampleRemainder -= this.resampleStep;
             }
-
-            // Send the Int16Array's underlying ArrayBuffer back to the main thread.
-            // Marking it as transferable ([pcm16.buffer]) improves performance
-            // by transferring ownership instead of copying.
-            this.port.postMessage({ type: 'audio_data', buffer: pcm16.buffer }, [pcm16.buffer]);
-
-            // Remove the processed frame from the buffer by shifting the remaining data
-            this._buffer.copyWithin(0, AUDIO_FRAME_LENGTH, this._bufferPos);
-            this._bufferPos -= AUDIO_FRAME_LENGTH;
+            if (resampled.length > 0) {
+                 currentInputSamples = new Float32Array(resampled);
+            } else {
+                // Not enough samples to form a resampled output yet, or resampleStep is very large
+                // This path needs careful handling in a real resampler.
+                // For now, if no resampled output, we skip this block.
+            }
         }
 
-        // Return true to keep the processor node alive and processing continuously.
-        // Return false would terminate the node.
-        return true;
-    }
 
-    // Optional: Process any remaining data in the buffer when stopping
-    // processRemainingBuffer() {
-    //     if (this._bufferPos > 0) {
-    //         console.log(`[AudioWorklet] Processing remaining ${this._bufferPos} samples.`);
-    //         // Simplified: Convert remaining data directly (might not be full frame)
-    //         const remainingFrame = this._buffer.slice(0, this._bufferPos);
-    //         const pcm16 = new Int16Array(this._bufferPos);
-    //          for (let j = 0; j < this._bufferPos; j++) {
-    //             pcm16[j] = Math.max(-32768, Math.min(32767, Math.floor(remainingFrame[j] * 32767)));
-    //         }
-    //         this.port.postMessage({ type: 'audio_data', buffer: pcm16.buffer }, [pcm16.buffer]);
-    //         this._bufferPos = 0;
-    //     }
-    // }
+        for (let i = 0; i < currentInputSamples.length; i++) {
+            if (this._bufferPos >= this._buffer.length) {
+                // Buffer is full, should not happen if flushed correctly
+                // For safety, drop oldest and continue, or just reset.
+                // This indicates an issue if frameLength is small relative to process block.
+                console.warn('AudioWorklet: Internal buffer overflow, resetting.');
+                this._bufferPos = 0; 
+            }
+            this._buffer[this._bufferPos++] = currentInputSamples[i];
+
+            if (this._bufferPos >= this.frameLength) {
+                const frameData = this._buffer.slice(0, this.frameLength);
+                
+                const int16Pcm = new Int16Array(this.frameLength);
+                for (let j = 0; j < this.frameLength; j++) {
+                    let s = Math.max(-1, Math.min(1, frameData[j]));
+                    int16Pcm[j] = s < 0 ? s * 0x8000 : s * 0x7FFF; // Scale to 16-bit
+                }
+
+                this.port.postMessage({ type: 'audioData', buffer: int16Pcm.buffer }, [int16Pcm.buffer]);
+                
+                // Shift remaining data in buffer
+                const remaining = this._buffer.slice(this.frameLength, this._bufferPos);
+                this._buffer.fill(0); 
+                this._buffer.set(remaining);
+                this._bufferPos = remaining.length;
+            }
+        }
+        return true; 
+    }
 }
 
-// Register the processor with a unique name.
-registerProcessor('audio-recorder-processor', AudioRecorderProcessor);
+registerProcessor('audio-stream-processor', AudioStreamProcessor);

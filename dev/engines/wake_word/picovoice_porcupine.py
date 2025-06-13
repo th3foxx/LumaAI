@@ -6,15 +6,13 @@ from .base import WakeWordEngineBase
 logger = logging.getLogger(__name__)
 
 class PicovoicePorcupineEngine(WakeWordEngineBase):
-    def __init__(self, access_key: str, keywords: List[str], sensitivities: List[float] = None, 
-                 model_path: str = None, library_path: str = None):
+    def __init__(self, access_key: str, keyword_paths: List[str], keywords: List[str] = None, sensitivities: List[float] = None,):
         try:
             self._porcupine = pvporcupine.create(
                 access_key=access_key,
                 keywords=keywords,
+                keyword_paths=keyword_paths,
                 sensitivities=sensitivities,
-                model_path=model_path,
-                library_path=library_path
             )
             logger.info(f"Porcupine initialized. Frame: {self.frame_length}, Rate: {self.sample_rate}, Version: {self.version}")
         except pvporcupine.PorcupineError as e:

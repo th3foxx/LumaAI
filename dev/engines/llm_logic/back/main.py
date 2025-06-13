@@ -68,7 +68,7 @@ offline_command_processor: Optional[OfflineCommandProcessorBase] = None
 class ConnectionManager: pass
 manager: Optional[ConnectionManager] = None
 
-ASSISTANT_THREAD_ID = "lumi-voice-assistant"
+ASSISTANT_THREAD_ID = "lumi-voice-assistant-session"
 
 def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings) -> Optional[Any]:
     logger.info(f"Creating engine: {engine_name} of type {engine_type}")
@@ -126,6 +126,7 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
             if engine_name == "langgraph":
                 return LangGraphLLMEngine(config={
                     "ai_settings": global_settings.ai,
+                    "postgres_settings": global_settings.postgres
                 })
         elif engine_type == "offline_llm_logic":
              if engine_name == "ollama":
