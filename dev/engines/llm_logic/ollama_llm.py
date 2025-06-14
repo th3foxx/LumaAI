@@ -66,12 +66,35 @@ class OllamaLLMEngine(LLMLogicEngineBase):
             return AIMessage(content=error_content) if return_full else error_content
 
     async def startup(self):
-        # Check if Ollama server is reachable?
-        # For now, we assume it's running if configured.
-        if self._llm:
-            logger.info("OllamaLLMEngine started. (Assumes Ollama server is running)")
-        else:
-            logger.warning("OllamaLLMEngine started, but LLM is not initialized (check config).")
+            """
+            Warms up the Ollama model by sending a simple, non-consequential request.
+            This forces the model to be loaded into memory before the first user request.
+            """
+            if self._llm:
+                logger.info(f"Warming up Ollama model '{self.settings.model}'...")
+                try:
+                    # A simple, quick prompt that doesn't require a complex answer.
+                    warmup_prompt = "Respond with just the word 'OK' to confirm you are ready."
+                    
+                    # Use ainvoke for the async call
+                    response = await self._llm.ainvoke([HumanMessage(content=warmup_prompt)])
+                    
+                    # Check if we got a response. The content doesn't matter as much as the fact that the call succeeded.
+                    if response and hasattr(response, 'content'):
+                        logger.info(f"Ollama model '{self.settings.model}' warmed up successfully. Response: '{response.content.strip()}'")
+                    else:
+                        logger.warning(f"Ollama model '{self.settings.model}' warmup request sent, but response was empty or invalid.")
+
+                except Exception as e:
+                    # This is not a critical failure for the whole app, so we just log it.
+                    # The user will just experience the delay on their first request.
+                    logger.error(
+                        f"Failed to warm up Ollama model '{self.settings.model}'. "
+                        f"The first request may be slow. Error: {e}",
+                        exc_info=True
+                    )
+            else:
+                logger.warning("OllamaLLMEngine started, but LLM is not initialized (check config). Skipping warmup.")
 
 
     async def shutdown(self):

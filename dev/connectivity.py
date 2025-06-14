@@ -1,4 +1,3 @@
-# --- START OF MODIFIED FILE connectivity.py ---
 import asyncio
 import socket
 import time
@@ -6,14 +5,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# --- Connectivity Cache & State ---
-_last_check_time: float = 0.0
-_last_check_result: bool | None = None # Legacy cache, can be phased out or kept as secondary
-_cache_duration: float = 60.0 # Legacy cache duration
-
+# --- Connectivity State (Simplified) ---
+# The background monitor's state is now the single source of truth.
+# The legacy time-based cache has been removed.
 _check_host: str = "8.8.8.8"
 _check_port: int = 53
-_check_timeout: float = 1.5 # Timeout for the socket connection attempt
+_check_timeout: float = 1.5      # Timeout for the socket connection attempt
 _monitoring_interval: float = 15.0 # How often the background task checks connectivity (seconds)
 
 # Global state for background monitoring
@@ -25,24 +22,18 @@ def set_connectivity_check_params(
     host: str = "8.8.8.8",
     port: int = 53,
     timeout: float = 1.5,
-    monitoring_interval: float = 15.0, # Added monitoring interval
-    cache_duration: float = 60.0 # Kept for compatibility if direct checks are still used
+    monitoring_interval: float = 15.0,
 ):
     """Allows overriding default connectivity check parameters."""
-    global _check_host, _check_port, _check_timeout, _monitoring_interval, _cache_duration
+    global _check_host, _check_port, _check_timeout, _monitoring_interval
     _check_host = host
     _check_port = port
     _check_timeout = timeout
     _monitoring_interval = monitoring_interval
-    _cache_duration = cache_duration
 
-    # Invalidate legacy cache on parameter change
-    global _last_check_time, _last_check_result
-    _last_check_time = 0.0
-    _last_check_result = None
     logger.info(
         f"Connectivity check params updated: Host={host}, Port={port}, Timeout={timeout}s, "
-        f"Monitoring Interval={_monitoring_interval}s, Cache Duration={_cache_duration}s"
+        f"Monitoring Interval={_monitoring_interval}s"
     )
 
 
@@ -98,7 +89,7 @@ async def start_connectivity_monitoring():
     """Starts the background connectivity monitoring task."""
     global _connectivity_monitoring_task, _internet_is_currently_available
     if _connectivity_monitoring_task is None or _connectivity_monitoring_task.done():
-        # Perform an initial check immediately
+        # Perform an initial check immediately to populate the state.
         _internet_is_currently_available = await _perform_check()
         logger.info(f"Initial internet connectivity status: {_internet_is_currently_available}")
 
@@ -128,25 +119,23 @@ async def stop_connectivity_monitoring():
 
 async def is_internet_available(force_check: bool = False) -> bool:
     """
-    Checks for internet connectivity.
-    Uses the state from the background monitor if available,
-    otherwise falls back to a direct check with caching.
+    Checks for internet connectivity using the state from the background monitor.
+
+    If the monitor has not yet run (e.g., at initial startup), it performs a
+    single direct check to determine the initial state.
 
     Args:
-        force_check: If True, performs a new direct check, bypassing monitor and cache.
+        force_check: If True, performs a new direct check, bypassing the monitor's state.
 
     Returns:
         True if internet connection is likely available, False otherwise.
     """
-    global _last_check_time, _last_check_result, _internet_is_currently_available
+    global _internet_is_currently_available
 
     if force_check:
         logger.debug("Forcing new connectivity check...")
         result = await _perform_check()
-        _last_check_time = time.monotonic() # Update legacy cache time as well
-        _last_check_result = result
-        # Also update the global monitor state if we force a check,
-        # as it's the most up-to-date info we have.
+        # Also update the global monitor state, as it's the most up-to-date info we have.
         if _internet_is_currently_available != result:
              logger.info(f"Forced check updated connectivity status to: {result}")
         _internet_is_currently_available = result
@@ -157,21 +146,10 @@ async def is_internet_available(force_check: bool = False) -> bool:
         logger.debug(f"Returning connectivity status from background monitor: {_internet_is_currently_available}")
         return _internet_is_currently_available
 
-    # Fallback to legacy cache if monitor hasn't run yet (e.g., very early startup)
-    now = time.monotonic()
-    if _last_check_result is not None and (now - _last_check_time) < _cache_duration:
-        logger.debug(f"Returning cached connectivity status (monitor not ready): {_last_check_result}")
-        return _last_check_result
-
-    # If monitor not ready and cache stale/empty, perform a direct check
-    logger.debug("Performing new connectivity check (monitor not ready, cache stale)...")
+    # Fallback for the very first call before the monitor has run.
+    # This performs a one-time check to establish the initial state.
+    logger.info("Performing initial connectivity check (monitor state not yet available)...")
     result = await _perform_check()
-    _last_check_time = now
-    _last_check_result = result
-    # Potentially initialize the monitored state here too if it's still None
-    if _internet_is_currently_available is None:
-        _internet_is_currently_available = result
-    logger.info(f"Direct connectivity check result: {result} (Cached for {_cache_duration}s)")
+    _internet_is_currently_available = result
+    logger.info(f"Initial connectivity check result: {result}. Background monitor will take over subsequent checks.")
     return result
-
-# --- END OF MODIFIED FILE connectivity.py ---
