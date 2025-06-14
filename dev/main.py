@@ -548,13 +548,15 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase beginning...")
     await start_connectivity_monitoring() # MODIFIED
     try:
-        init_scheduler_db()
-        init_music_likes_table()
+        # --- ИЗМЕНЕНИЕ: Вызываем асинхронные версии ---
+        await init_scheduler_db()
+        await init_music_likes_table()
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         logger.info("Attempting to trigger MPD library update on startup...")
         if not await trigger_mpd_library_update():
-            logger.warning("MPD library update command failed to send on startup. Check MPD connection and mpc tool.")
+            logger.warning("MPD library update command failed to send on startup.")
     except Exception as e:
-        logger.error(f"Failed to initialize databases or trigger MPD update: {e}. Some features might not work.", exc_info=True)
+        logger.error(f"Failed to initialize databases or trigger MPD update: {e}.", exc_info=True)
         
     await initialize_global_engines(settings)
 

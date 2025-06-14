@@ -1,33 +1,27 @@
-import asyncio
+import aiosqlite
 import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 
-import dateparser # Needs installation: pip install dateparser
+import dateparser
 from settings import settings
 from langchain_core.tools import tool
 
-# Assuming settings.py is accessible or define DB path here
-# from settings import settings # If settings has a DB path
-DB_PATH = settings.scheduler_db_path # Simple file-based database
-
+DB_PATH = settings.scheduler_db_path
 logger = logging.getLogger(__name__)
 
 # --- Database Setup ---
 
-def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row # Return rows as dictionary-like objects
-    return conn
+def get_db_connection() -> aiosqlite.Connection:
+    """Returns a coroutine that creates an async connection to the SQLite database."""
+    return aiosqlite.connect(DB_PATH)
 
-def init_db():
+async def init_db():
     """Initializes the database table if it doesn't exist."""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+        async with get_db_connection() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     description TEXT NOT NULL,
@@ -37,117 +31,81 @@ def init_db():
                     status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'triggered', 'cancelled', 'error'))
                 )
             """)
-            # Add index for faster querying of pending reminders
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_reminders ON reminders (due_time_utc, status)")
-            conn.commit()
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_reminders ON reminders (due_time_utc, status)")
+            await conn.commit()
             logger.info(f"Database initialized successfully at {DB_PATH}")
-    except sqlite3.Error as e:
+    except aiosqlite.Error as e:
         logger.error(f"Database initialization failed: {e}", exc_info=True)
-        raise # Re-raise to potentially halt startup if DB is critical
-
-# Call init_db() when the module is loaded, ensuring the table exists
-# Be careful with doing this at module level in complex apps,
-# but for this single-process app, it's likely okay.
-# Alternatively, call it explicitly during FastAPI startup.
-# init_db() # Let's call it explicitly in main.py startup instead
+        raise
 
 # --- Reminder Logic ---
 
 async def add_reminder_to_db(description: str, due_time_utc: datetime, original_time_desc: str) -> Optional[int]:
-    """Adds a new reminder to the database."""
-    sql = """
-        INSERT INTO reminders (description, due_time_utc, original_time_description, status)
-        VALUES (?, ?, ?, 'pending')
-    """
+    sql = "INSERT INTO reminders (description, due_time_utc, original_time_description, status) VALUES (?, ?, ?, 'pending')"
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, (description, due_time_utc, original_time_desc))
-            conn.commit()
+        async with get_db_connection() as conn:
+            cursor = await conn.execute(sql, (description, due_time_utc, original_time_desc))
+            await conn.commit()
             reminder_id = cursor.lastrowid
             logger.info(f"Reminder added with ID: {reminder_id}, Due: {due_time_utc.isoformat()}")
             return reminder_id
-    except sqlite3.Error as e:
+    except aiosqlite.Error as e:
         logger.error(f"Failed to add reminder to DB: {e}", exc_info=True)
         return None
 
 async def get_pending_reminders_from_db() -> List[Dict[str, Any]]:
-    """Retrieves all reminders with 'pending' status."""
     sql = "SELECT id, description, due_time_utc, original_time_description FROM reminders WHERE status = 'pending' ORDER BY due_time_utc ASC"
     reminders = []
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-            for row in rows:
-                reminders.append(dict(row)) # Convert sqlite3.Row to dict
-            return reminders
-    except sqlite3.Error as e:
+        async with get_db_connection() as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(sql) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    reminders.append(dict(row))
+        return reminders
+    except aiosqlite.Error as e:
         logger.error(f"Failed to retrieve pending reminders: {e}", exc_info=True)
-        return [] # Return empty list on error
+        return []
 
 async def cancel_reminder_in_db(reminder_id: int) -> bool:
-    """Marks a reminder as 'cancelled' in the database."""
     sql = "UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'"
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, (reminder_id,))
-            conn.commit()
-            if cursor.rowcount > 0:
-                logger.info(f"Reminder ID {reminder_id} cancelled.")
-                return True
-            else:
-                logger.warning(f"Reminder ID {reminder_id} not found or already not pending.")
-                return False
-    except sqlite3.Error as e:
+        async with get_db_connection() as conn:
+            cursor = await conn.execute(sql, (reminder_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+    except aiosqlite.Error as e:
         logger.error(f"Failed to cancel reminder ID {reminder_id}: {e}", exc_info=True)
         return False
 
 async def get_due_reminders_and_mark_triggered() -> List[Dict[str, Any]]:
-    """
-    Finds pending reminders that are due, marks them as 'triggered',
-    and returns them. This should be atomic if possible, but SQLite
-    transactions help.
-    """
     now_utc = datetime.now(timezone.utc)
-    select_sql = """
-        SELECT id, description, due_time_utc, original_time_description
-        FROM reminders
-        WHERE due_time_utc <= ? AND status = 'pending'
-    """
+    select_sql = "SELECT id, description, due_time_utc, original_time_description FROM reminders WHERE due_time_utc <= ? AND status = 'pending'"
     update_sql = "UPDATE reminders SET status = 'triggered' WHERE id = ?"
     due_reminders = []
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            # Find due reminders
-            cursor.execute(select_sql, (now_utc,))
-            rows_to_trigger = cursor.fetchall()
+        async with get_db_connection() as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(select_sql, (now_utc,)) as cursor:
+                rows_to_trigger = await cursor.fetchall()
 
             if not rows_to_trigger:
-                return [] # No due reminders
+                return []
 
-            # Mark them as triggered and collect them
             for row in rows_to_trigger:
                 reminder_dict = dict(row)
                 try:
-                    cursor.execute(update_sql, (reminder_dict['id'],))
-                    # Only add to list if update was successful (rowcount check isn't reliable here)
+                    await conn.execute(update_sql, (reminder_dict['id'],))
                     due_reminders.append(reminder_dict)
-                    logger.info(f"Marked reminder ID {reminder_dict['id']} as triggered.")
-                except sqlite3.Error as update_err:
+                except aiosqlite.Error as update_err:
                      logger.error(f"Failed to mark reminder ID {reminder_dict['id']} as triggered: {update_err}", exc_info=True)
-                     # Optionally mark as 'error' status here?
-                     # cursor.execute("UPDATE reminders SET status = 'error' WHERE id = ?", (reminder_dict['id'],))
-
-            conn.commit() # Commit all updates together
-            return due_reminders
-    except sqlite3.Error as e:
+            
+            await conn.commit()
+        return due_reminders
+    except aiosqlite.Error as e:
         logger.error(f"Failed to check/trigger due reminders: {e}", exc_info=True)
         return []
-
 
 # --- Tool Definitions ---
 
@@ -246,21 +204,19 @@ async def cancel_reminder(reminder_id: int) -> str:
         return "Error: Please provide a valid reminder ID (a positive number). You can use 'list reminders' to find the ID."
 
     success = await cancel_reminder_in_db(reminder_id)
-
+    
     if success:
         return f"Okay, reminder ID {reminder_id} has been cancelled."
     else:
-        # Check if it existed but wasn't pending
         try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT status FROM reminders WHERE id = ?", (reminder_id,))
-                result = cursor.fetchone()
-                if result:
-                    status = result['status']
-                    return f"Could not cancel reminder ID {reminder_id}. Its current status is '{status}' (it might have already triggered or been cancelled)."
-                else:
-                    return f"Sorry, I couldn't find a reminder with ID {reminder_id}."
-        except sqlite3.Error as e:
-             logger.error(f"Database error checking status for reminder ID {reminder_id} after failed cancellation: {e}")
-             return f"Sorry, I couldn't cancel reminder ID {reminder_id}. There might have been a database error or it doesn't exist."
+            async with get_db_connection() as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.execute("SELECT status FROM reminders WHERE id = ?", (reminder_id,)) as cursor:
+                    result = await cursor.fetchone()
+            if result:
+                return f"Could not cancel reminder ID {reminder_id}. Its current status is '{result['status']}'."
+            else:
+                return f"Sorry, I couldn't find a reminder with ID {reminder_id}."
+        except aiosqlite.Error as e:
+             logger.error(f"Database error checking status for reminder ID {reminder_id}: {e}")
+             return f"Sorry, I couldn't cancel reminder ID {reminder_id} due to a database error."
