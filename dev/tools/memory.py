@@ -4,6 +4,7 @@ import logging
 import asyncio
 from typing import Optional, Any, List, Dict
 from langchain_core.tools import tool
+from connectivity import is_internet_available
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,12 @@ async def add_personal_memory(memory_text: str, category: Optional[str] = None) 
     Useful for when the user says 'remember that...' or 'take a note...'.
     This tool returns immediately and saves the memory in the background.
     """
+    # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+    if not await is_internet_available():
+        logger.warning("Attempted to use add_personal_memory, but no internet connection is available.")
+        return "Sorry, I can't save this to my long-term memory right now because I'm offline."
+    # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+
     if not mem0_client or not mem0_user_id:
         logger.warning("Attempted to use add_personal_memory, but memory client is not initialized.")
         return "Error: The long-term memory service is not available right now."
@@ -81,6 +88,12 @@ async def search_personal_memories(query: str) -> str:
     For example, if the user asks 'What do you know about my preferences?', you should use this tool with a query like 'user preferences'.
     Returns a concise list of the most relevant facts.
     """
+    # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+    if not await is_internet_available():
+        logger.warning("Attempted to use search_personal_memories, but no internet connection is available.")
+        return "Sorry, I can't search my long-term memory right now because I'm offline."
+    # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+    
     if not mem0_client or not mem0_user_id:
         logger.warning("Attempted to use search_personal_memories, but memory client is not initialized.")
         return "Error: The long-term memory service is not available right now."

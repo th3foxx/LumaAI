@@ -121,6 +121,14 @@ async def ltm_batch_saving_worker(mem0_client: AsyncMemory, interval_seconds: in
     while True:
         try:
             await asyncio.sleep(interval_seconds)
+
+            # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+            # Проверяем интернет ПЕРЕД тем, как брать блокировку и обрабатывать буфер
+            if not await is_internet_available():
+                logger.info("LTM Worker (Timer): Skipping save, no internet connection.")
+                # Не очищаем буфер, попробуем в следующий раз
+                continue
+            # --- ИЗМЕНЕНИЕ КОНЕЦ -
             
             buffer_to_process = defaultdict(list)
             async with LTM_BUFFER_LOCK:
@@ -138,13 +146,19 @@ async def ltm_batch_saving_worker(mem0_client: AsyncMemory, interval_seconds: in
 
         except asyncio.CancelledError:
             logger.info("LTM Batch Saving Worker is shutting down.")
-            logger.info("Performing final LTM save on shutdown...")
-            async with LTM_BUFFER_LOCK:
-                final_buffer = dict(LTM_MESSAGE_BUFFER)
-                LTM_MESSAGE_BUFFER.clear()
-            for thread_id, messages in final_buffer.items():
-                await _save_thread_messages_to_ltm(mem0_client, thread_id, messages)
-            logger.info("Final LTM save complete.")
+            # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+            # Принудительное сохранение при выключении, если есть интернет
+            if await is_internet_available(force_check=True):
+                logger.info("Performing final LTM save on shutdown...")
+                async with LTM_BUFFER_LOCK:
+                    final_buffer = dict(LTM_MESSAGE_BUFFER)
+                    LTM_MESSAGE_BUFFER.clear()
+                for thread_id, messages in final_buffer.items():
+                    await _save_thread_messages_to_ltm(mem0_client, thread_id, messages)
+                logger.info("Final LTM save complete.")
+            else:
+                logger.warning("Skipping final LTM save on shutdown: no internet connection.")
+            # --- ИЗМЕНЕНИЕ КОНЕЦ ---
             break
         except Exception as e:
             logger.error(f"LTM Batch Saving Worker encountered a critical error: {e}", exc_info=True)
@@ -893,24 +907,29 @@ class ConnectionManager:
                         _candidate_response = llm_result.get("response")
                         messages_for_ltm = llm_result.get("ltm_messages", [])
 
-                        # --- НОВАЯ ЛОГИКА: Добавляем сообщения в буфер ---
-                        if messages_for_ltm:
-                            async with LTM_BUFFER_LOCK:
-                                if thread_id not in LTM_MESSAGE_BUFFER:
-                                    LTM_MESSAGE_BUFFER[thread_id] = []
-                                LTM_MESSAGE_BUFFER[thread_id].extend(messages_for_ltm)
-                                logger.debug(f"Added {len(messages_for_ltm)} messages to LTM buffer for thread '{thread_id}'. "
-                                            f"Current size: {len(LTM_MESSAGE_BUFFER[thread_id])}.")
-                                
-                                # --- НОВАЯ ЛОГИКА: Принудительный сброс буфера, если он переполнен ---
-                                if len(LTM_MESSAGE_BUFFER[thread_id]) >= MAX_BUFFER_SIZE_PER_THREAD:
-                                    logger.info(f"LTM buffer for thread '{thread_id}' reached max size. Triggering immediate save.")
-                                    messages_to_save_now = list(LTM_MESSAGE_BUFFER[thread_id])
-                                    LTM_MESSAGE_BUFFER[thread_id].clear()
-                                    # Запускаем сохранение в фоне, чтобы не блокировать ответ пользователю
-                                    asyncio.create_task(
-                                        _save_thread_messages_to_ltm(mem0_client, thread_id, messages_to_save_now)
-                                    )
+                        # --- ИЗМЕНЕНИЕ НАЧАЛО ---
+                        # Добавляем сообщения в буфер LTM, только если есть интернет и Mem0 включен
+                        if messages_for_ltm and mem0_client:
+                            # Проверка online_capable здесь является избыточной, т.к. мы бы не попали сюда без интернета,
+                            # но она делает код более явным и безопасным.
+                            if online_capable:
+                                async with LTM_BUFFER_LOCK:
+                                    if thread_id not in LTM_MESSAGE_BUFFER:
+                                        LTM_MESSAGE_BUFFER[thread_id] = []
+                                    LTM_MESSAGE_BUFFER[thread_id].extend(messages_for_ltm)
+                                    logger.debug(f"Added {len(messages_for_ltm)} messages to LTM buffer for thread '{thread_id}'. "
+                                                f"Current size: {len(LTM_MESSAGE_BUFFER[thread_id])}.")
+                                    
+                                    if len(LTM_MESSAGE_BUFFER[thread_id]) >= MAX_BUFFER_SIZE_PER_THREAD:
+                                        logger.info(f"LTM buffer for thread '{thread_id}' reached max size. Triggering immediate save.")
+                                        messages_to_save_now = list(LTM_MESSAGE_BUFFER[thread_id])
+                                        LTM_MESSAGE_BUFFER[thread_id].clear()
+                                        asyncio.create_task(
+                                            _save_thread_messages_to_ltm(mem0_client, thread_id, messages_to_save_now)
+                                        )
+                            else:
+                                logger.info("Skipping adding messages to LTM buffer: no internet connection.")
+                        # --- ИЗМЕНЕНИЕ КОНЕЦ ---
                         
                         # Check if the response is not empty and not a generic error message from the LLM itself
                         # Error messages from LangGraphLLM.ask start with "Sorry, an error occurred" or "Sorry, the language model is not available"
