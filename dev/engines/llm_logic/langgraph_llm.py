@@ -1,9 +1,11 @@
+# langgraph_llm.py
+
 import os
 import logging
 import asyncio
-from typing import Annotated, Union, Dict, Any, List, Optional
+from typing import Annotated, Union, Dict, Any, List, Optional, Callable, Coroutine
 
-from langchain_core.messages import ( # Убедитесь, что SystemMessage импортирован
+from langchain_core.messages import (
     BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage, RemoveMessage
 )
 from langchain_openai import ChatOpenAI
@@ -31,16 +33,17 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.ai_settings: AISettings = config["ai_settings"]
-        self.mem0_client: Optional[Any] = config.get("mem0_client")
+        
+        # --- ИСПРАВЛЕНИЕ: Удалены устаревшие проверки LTM-атрибутов ---
+        # Эти проверки больше не нужны, так как движок не отвечает за LTM.
+
         self.graph = None
         self.memory = None
         self.llm_with_tools = None
         self.max_conversation_messages: int = DEFAULT_MAX_CONVERSATION_MESSAGES
         
-        # Получение системного промпта из настроек
         self.system_prompt_content: str = self.ai_settings.system_prompt 
         logger.info(f"Using system prompt: '{self.system_prompt_content[:100]}...'")
-
 
         if not self.ai_settings.openai_api_base:
             logger.error("OPENAI_API_BASE is not set. LangGraphLLMEngine requires it for the LLM.")
@@ -104,23 +107,16 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
         self.graph = graph_builder.compile(checkpointer=self.memory)
         logger.info("LangGraphLLMEngine initialized successfully with tools, memory-based checkpointer, message pruning, and system prompt.")
 
+
     def _chatbot_node_func(self, state: State) -> Dict[str, List[BaseMessage]]:
         current_messages_from_state: List[BaseMessage] = state["messages"]
         logger.debug(f"Chatbot node: {len(current_messages_from_state)} messages in state. Max set to {self.max_conversation_messages}.")
 
         messages_to_update_state: List[BaseMessage] = []
         
-        # --- Determine messages to send to LLM ---
-        # LLM sees up to (max_conversation_messages - 1) messages from history, plus the system prompt.
-        # So, we take (max_conversation_messages - 1 - 1) if system prompt is always added.
-        # Or, more simply, the window of history messages is (max_conversation_messages - 1).
-        # The system prompt will be prepended to this window.
-
-        # The number of history messages to consider for LLM input (excluding system prompt)
         num_history_messages_for_llm = self.max_conversation_messages - 1
-        if num_history_messages_for_llm < 0: # Should not happen with MIN_CONVERSATION_MESSAGES >= 1
+        if num_history_messages_for_llm < 0:
             num_history_messages_for_llm = 0
-
 
         actual_history_llm_input_size = min(len(current_messages_from_state), num_history_messages_for_llm)
         
@@ -142,20 +138,15 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
                     history_for_llm_input = [current_messages_from_state[-1]]
         
         elif len(current_messages_from_state) > 0 and num_history_messages_for_llm == 0 :
-            # This case means max_conversation_messages might be 1.
-            # We still want to send the last user message if available.
             logger.warning(
                 f"Calculated history LLM input size is 0 (max_messages={self.max_conversation_messages}). "
                 f"Sending the last message from state if available."
             )
             history_for_llm_input = [current_messages_from_state[-1]]
 
-
-        # Prepend the system prompt
         messages_for_llm_input = [SystemMessage(content=self.system_prompt_content)] + history_for_llm_input
         
-        # --- Determine messages to remove from state (for overall history pruning) ---
-        if (len(current_messages_from_state) + 1) > self.max_conversation_messages: # +1 for the upcoming AI response
+        if (len(current_messages_from_state) + 1) > self.max_conversation_messages:
             num_to_remove_from_state = (len(current_messages_from_state) + 1) - self.max_conversation_messages
             if num_to_remove_from_state > 0:
                 messages_to_be_deleted = current_messages_from_state[:num_to_remove_from_state]
@@ -167,69 +158,22 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
         
         logger.debug(f"Invoking LLM with {len(messages_for_llm_input)} messages (incl. system prompt). History snippet: {[str(type(m)) + ': ' + str(m.content)[:70] + (' (tool_calls)' if isinstance(m, AIMessage) and m.tool_calls else '') + (f'(tool_id:{m.tool_call_id})' if isinstance(m, ToolMessage) else '') for m in history_for_llm_input]}")
 
-        if len(messages_for_llm_input) == 1 and isinstance(messages_for_llm_input[0], SystemMessage) and len(current_messages_from_state) == 0:
-            # This is the very first turn, only system prompt is sent.
-            # Some LLMs might expect a HumanMessage after SystemMessage.
-            # However, LangChain's ChatOpenAI should handle this.
-            # If issues arise, one might add a dummy HumanMessage or ensure `ask` always provides one.
-            # Current `ask` method always adds a HumanMessage to the state *before* this node is called,
-            # so `current_messages_from_state` will contain that HumanMessage, and `history_for_llm_input` won't be empty.
-            pass
-        elif not history_for_llm_input and len(current_messages_from_state) > 0:
+        if not history_for_llm_input and len(current_messages_from_state) > 0:
              logger.error("Critical: history_for_llm_input is empty, but current_messages_from_state was not. This indicates a logic flaw in history preparation.")
-             # As a last resort, send system prompt + last message from state
              messages_for_llm_input = [SystemMessage(content=self.system_prompt_content), current_messages_from_state[-1]]
         elif not history_for_llm_input and len(current_messages_from_state) == 0:
             logger.warning("Chatbot node: history_for_llm_input is empty because current_messages_from_state is empty. Sending only system prompt.")
-            # messages_for_llm_input will just be [SystemMessage(...)]
 
         response_message = self.llm_with_tools.invoke(messages_for_llm_input)
         messages_to_update_state.append(response_message)
         
         return {"messages": messages_to_update_state}
-    
 
-    async def _add_conversation_to_memory(self, messages_to_add: List[BaseMessage], thread_id: str):
-        """
-        Асинхронная фоновая задача для добавления сообщений в долговременную память.
-        Принимает список объектов BaseMessage и форматирует их в список словарей.
-        """
-        if not self.mem0_client or not messages_to_add:
-            return
-
-        try:
-            # Словарь для преобразования типов LangChain в роли, понятные mem0
-            role_map = {
-                "human": "user",
-                "ai": "assistant",
-                "system": "system", 
-            }
-
-            # Преобразуем список объектов BaseMessage в список словарей
-            formatted_messages = [
-                {"role": role_map.get(msg.type), "content": msg.content}
-                for msg in messages_to_add
-                if msg.type in role_map and msg.content
-            ]
-
-            if not formatted_messages:
-                logger.warning("No messages to add to memory after formatting.")
-                return
-
-            logger.debug(f"Adding conversation context to long-term memory for thread '{thread_id}'. Messages: {formatted_messages}")
-            
-            # Передаем в mem0 отформатированный список сообщений
-            await self.mem0_client.add(messages=formatted_messages, user_id=thread_id)
-            
-            logger.info(f"Successfully tasked adding context of {len(formatted_messages)} messages to long-term memory for thread '{thread_id}'.")
-        except Exception as e:
-            logger.error(f"Background task to add memory failed: {e}", exc_info=True)
-
-
-    async def ask(self, question: str, thread_id: str, return_full: bool = False) -> Union[str, BaseMessage]:
+    async def ask(self, question: str, thread_id: str, return_full: bool = False) -> Union[str, BaseMessage, Dict[str, Any]]:
         if not self.graph:
             logger.error("LangGraph graph is not compiled. Cannot process 'ask' request.")
-            return "Error: LLM Engine is not properly initialized."
+            # Возвращаем словарь, чтобы соответствовать новому формату
+            return {"response": "Error: LLM Engine is not properly initialized.", "ltm_messages": []}
 
         graph_config = {"configurable": {"thread_id": thread_id}}
         
@@ -242,7 +186,8 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
             final_state_dict = await self.graph.ainvoke(input_data, graph_config)
         except Exception as e:
             logger.error(f"Error during LangGraph ainvoke for thread_id='{thread_id}': {e}", exc_info=True)
-            return f"Sorry, an error occurred while I was thinking: {str(e)}"
+            # Возвращаем словарь, чтобы соответствовать новому формату
+            return {"response": f"Sorry, an error occurred while I was thinking: {str(e)}", "ltm_messages": []}
 
         all_messages: List[BaseMessage] = final_state_dict.get("messages", [])
         
@@ -252,30 +197,39 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
                 last_ai_message = msg
                 break
         
-        # --- ФОНОВОЕ ДОБАВЛЕНИЕ В ПАМЯТЬ (КОНТЕКСТОМ) ---
-        if self.mem0_client:
-            # Определяем, сколько сообщений мы хотим сохранить как контекст.
-            # 4 сообщения = 2 последних витка диалога (user -> assistant, user -> assistant)
-            CONTEXT_SIZE_FOR_MEMORY = 4 
+        messages_for_ltm = []
+        try:
+            start_index = -1
+            for i in range(len(all_messages) - 1, -1, -1):
+                msg = all_messages[i]
+                if isinstance(msg, HumanMessage) and msg.content == input_message.content:
+                    start_index = i
+                    break
             
-            # Берем срез из последних сообщений.
-            messages_to_store = all_messages[-CONTEXT_SIZE_FOR_MEMORY:]
-            
-            if messages_to_store:
-                # Запускаем сохранение в память как фоновую задачу.
-                asyncio.create_task(
-                    self._add_conversation_to_memory(messages_to_store, thread_id)
-                )
-        # --- КОНЕЦ БЛОКА ---
+            if start_index != -1:
+                messages_for_ltm = all_messages[start_index:]
+                logger.debug(f"Identified {len(messages_for_ltm)} messages from this turn for potential LTM saving.")
+            else:
+                logger.warning("Could not find exact start of the turn in messages. LTM might miss this turn.")
+
+        except Exception as e:
+            logger.error(f"Error determining messages for LTM: {e}")
+
+        result = {
+            "response": "I'm sorry, I couldn't formulate a response.",
+            "ltm_messages": messages_for_ltm
+        }
 
         if last_ai_message:
             logger.info(f"LLM response for thread_id='{thread_id}' successfully retrieved. Total messages in state: {len(all_messages)}.")
             if return_full:
-                return last_ai_message
-            return last_ai_message.content
+                result["response"] = last_ai_message
+            else:
+                result["response"] = last_ai_message.content
         else:
-            logger.warning(f"No AIMessage found in the final state for thread_id='{thread_id}'. Full state messages: {all_messages}")
-            return "I'm sorry, I couldn't formulate a response."
+            logger.warning(f"No AIMessage found in the final state for thread_id='{thread_id}'.")
+
+        return result
 
     async def startup(self):
         logger.info("LangGraphLLMEngine startup: No specific actions needed for MemorySaver.")

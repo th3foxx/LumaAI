@@ -6,7 +6,9 @@ import os
 import struct
 import wave # Added for loading activation sound
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from collections import defaultdict
+from langchain_core.messages import BaseMessage
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -69,10 +71,111 @@ comm_service: Optional[CommunicationServiceBase] = None
 offline_command_processor: Optional[OfflineCommandProcessorBase] = None
 mem0_client: Optional[Any] = None
 
+# --- НОВЫЙ КОД: Глобальный буфер и воркер ---
+LTM_MESSAGE_BUFFER: Dict[str, List[BaseMessage]] = defaultdict(list)
+LTM_WORKER_TASK: Optional[asyncio.Task] = None
+LTM_BUFFER_LOCK = asyncio.Lock()
+# Новый параметр: максимальный размер буфера на поток перед принудительной отправкой
+MAX_BUFFER_SIZE_PER_THREAD = 30
+
 class ConnectionManager: pass
 manager: Optional[ConnectionManager] = None
 
 ASSISTANT_THREAD_ID = "lumi-voice-assistant"
+
+async def _save_thread_messages_to_ltm(mem0_client: AsyncMemory, thread_id: str, messages: List[BaseMessage]):
+    """
+    Вспомогательная функция для сохранения сообщений одного потока в LTM.
+    Инкапсулирует логику форматирования и вызова mem0.
+    """
+    if not messages:
+        return
+
+    try:
+        role_map = {"human": "user", "ai": "assistant", "system": "system"}
+        formatted_messages = [
+            {"role": role_map.get(msg.type), "content": msg.content}
+            for msg in messages
+            if msg.type in role_map and msg.content
+        ]
+
+        if not formatted_messages:
+            logger.warning(f"LTM Save: No messages to add for thread '{thread_id}' after formatting.")
+            return
+
+        logger.info(f"LTM Save: Saving {len(formatted_messages)} messages for thread '{thread_id}'.")
+        await mem0_client.add(messages=formatted_messages, user_id=thread_id)
+        logger.info(f"LTM Save: Successfully saved context for thread '{thread_id}'.")
+
+    except Exception as e:
+        logger.error(f"LTM Save: Failed to save memory for thread '{thread_id}': {e}", exc_info=True)
+        # В случае ошибки можно решить, что делать с сообщениями.
+        # Пока просто логируем.
+
+async def ltm_batch_saving_worker(mem0_client: AsyncMemory, interval_seconds: int):
+    """
+    Фоновый воркер, который периодически сохраняет сообщения из буфера в mem0.
+    Это ЕДИНСТВЕННОЕ место, которое читает из буфера и инициирует сохранение.
+    """
+    logger.info(f"LTM Batch Saving Worker started. Save interval: {interval_seconds}s.")
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            
+            buffer_to_process = defaultdict(list)
+            async with LTM_BUFFER_LOCK:
+                if not LTM_MESSAGE_BUFFER:
+                    continue
+                
+                # Копируем весь буфер для обработки и сразу очищаем оригинал
+                buffer_to_process = LTM_MESSAGE_BUFFER.copy()
+                LTM_MESSAGE_BUFFER.clear()
+
+            logger.info(f"LTM Worker (Timer): Processing buffer with {len(buffer_to_process)} threads.")
+
+            for thread_id, messages_to_add in buffer_to_process.items():
+                await _save_thread_messages_to_ltm(mem0_client, thread_id, messages_to_add)
+
+        except asyncio.CancelledError:
+            logger.info("LTM Batch Saving Worker is shutting down.")
+            logger.info("Performing final LTM save on shutdown...")
+            async with LTM_BUFFER_LOCK:
+                final_buffer = dict(LTM_MESSAGE_BUFFER)
+                LTM_MESSAGE_BUFFER.clear()
+            for thread_id, messages in final_buffer.items():
+                await _save_thread_messages_to_ltm(mem0_client, thread_id, messages)
+            logger.info("Final LTM save complete.")
+            break
+        except Exception as e:
+            logger.error(f"LTM Batch Saving Worker encountered a critical error: {e}", exc_info=True)
+            await asyncio.sleep(60) # Пауза перед следующей попыткой в случае ошибки
+
+async def start_ltm_worker(mem0_client: AsyncMemory):
+    """Запускает фоновый воркер, если он еще не запущен."""
+    global LTM_WORKER_TASK
+    if LTM_WORKER_TASK is None or LTM_WORKER_TASK.done():
+        if mem0_client:
+            # Стало:
+            save_interval = 300
+            LTM_WORKER_TASK = asyncio.create_task(
+                ltm_batch_saving_worker(mem0_client, save_interval)
+            )
+        else:
+            logger.warning("Cannot start LTM worker: mem0_client is not available.")
+
+async def stop_ltm_worker():
+    """Останавливает фоновый воркер."""
+    global LTM_WORKER_TASK
+    if LTM_WORKER_TASK and not LTM_WORKER_TASK.done():
+        logger.info("Stopping LTM Batch Saving Worker...")
+        LTM_WORKER_TASK.cancel()
+        try:
+            await LTM_WORKER_TASK
+        except asyncio.CancelledError:
+            pass # Ожидаемое исключение
+        logger.info("LTM Batch Saving Worker stopped.")
+    LTM_WORKER_TASK = None
+# --- КОНЕЦ НОВОГО КОДА ---
 
 def create_engine_instance(engine_type: str, engine_name: str, global_settings: Settings) -> Optional[Any]:
     logger.info(f"Creating engine: {engine_name} of type {engine_type}")
@@ -128,9 +231,9 @@ def create_engine_instance(engine_type: str, engine_name: str, global_settings: 
                 return RasaNLUEngine(config=global_settings.rasa_nlu)
         elif engine_type == "llm_logic":
             if engine_name == "langgraph":
+                # --- УПРОЩЕННЫЙ КОНФИГ ---
                 return LangGraphLLMEngine(config={
                     "ai_settings": global_settings.ai,
-                    "mem0_client": mem0_client,
                 })
         elif engine_type == "offline_llm_logic":
              if engine_name == "ollama":
@@ -455,6 +558,10 @@ async def lifespan(app: FastAPI):
         
     await initialize_global_engines(settings)
 
+    # --- НОВЫЙ КОД: Запускаем воркер ---
+    await start_ltm_worker(mem0_client)
+    # --- КОНЕЦ НОВОГО КОДА -
+
     global tts_engine, audio_output_engine # manager is already global
     if tts_engine and audio_output_engine and await tts_engine.is_healthy() and audio_output_engine.is_enabled:
         if not settings.scheduler_db_path:
@@ -475,6 +582,9 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan: Startup phase complete.")
     yield
     logger.info("Lifespan: Shutdown phase beginning...")
+    # --- НОВЫЙ КОД: Останавливаем воркер ---
+    await stop_ltm_worker()
+    # --- КОНЕЦ НОВОГО КОДА --
     await stop_reminder_checker()
     await shutdown_global_engines()
     await stop_connectivity_monitoring() # MODIFIED
@@ -774,8 +884,31 @@ class ConnectionManager:
                     online_llm_attempt_made = True
                     logger.info("Using online LLM (LangGraph).")
                     try:
-                        lumi_response = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
-                        _candidate_response = lumi_response if isinstance(lumi_response, str) else lumi_response.content # type: ignore
+                        # --- ИЗМЕНЕНИЕ: Обрабатываем структурированный ответ ---
+                        llm_result = await self.llm_logic_engine.ask(text, thread_id=thread_id) # type: ignore
+                        
+                        # Распаковываем ответ и сообщения для LTM
+                        _candidate_response = llm_result.get("response")
+                        messages_for_ltm = llm_result.get("ltm_messages", [])
+
+                        # --- НОВАЯ ЛОГИКА: Добавляем сообщения в буфер ---
+                        if messages_for_ltm:
+                            async with LTM_BUFFER_LOCK:
+                                if thread_id not in LTM_MESSAGE_BUFFER:
+                                    LTM_MESSAGE_BUFFER[thread_id] = []
+                                LTM_MESSAGE_BUFFER[thread_id].extend(messages_for_ltm)
+                                logger.debug(f"Added {len(messages_for_ltm)} messages to LTM buffer for thread '{thread_id}'. "
+                                            f"Current size: {len(LTM_MESSAGE_BUFFER[thread_id])}.")
+                                
+                                # --- НОВАЯ ЛОГИКА: Принудительный сброс буфера, если он переполнен ---
+                                if len(LTM_MESSAGE_BUFFER[thread_id]) >= MAX_BUFFER_SIZE_PER_THREAD:
+                                    logger.info(f"LTM buffer for thread '{thread_id}' reached max size. Triggering immediate save.")
+                                    messages_to_save_now = list(LTM_MESSAGE_BUFFER[thread_id])
+                                    LTM_MESSAGE_BUFFER[thread_id].clear()
+                                    # Запускаем сохранение в фоне, чтобы не блокировать ответ пользователю
+                                    asyncio.create_task(
+                                        _save_thread_messages_to_ltm(mem0_client, thread_id, messages_to_save_now)
+                                    )
                         
                         # Check if the response is not empty and not a generic error message from the LLM itself
                         # Error messages from LangGraphLLM.ask start with "Sorry, an error occurred" or "Sorry, the language model is not available"
