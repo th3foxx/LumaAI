@@ -172,7 +172,6 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
     async def ask(self, question: str, thread_id: str, return_full: bool = False) -> Union[str, BaseMessage, Dict[str, Any]]:
         if not self.graph:
             logger.error("LangGraph graph is not compiled. Cannot process 'ask' request.")
-            # Возвращаем словарь, чтобы соответствовать новому формату
             return {"response": "Error: LLM Engine is not properly initialized.", "ltm_messages": []}
 
         graph_config = {"configurable": {"thread_id": thread_id}}
@@ -183,37 +182,25 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
         logger.debug(f"Invoking LangGraph for thread_id='{thread_id}' with new question.")
         
         try:
+            # ainvoke выполняет граф и возвращает конечное состояние
             final_state_dict = await self.graph.ainvoke(input_data, graph_config)
         except Exception as e:
             logger.error(f"Error during LangGraph ainvoke for thread_id='{thread_id}': {e}", exc_info=True)
-            # Возвращаем словарь, чтобы соответствовать новому формату
             return {"response": f"Sorry, an error occurred while I was thinking: {str(e)}", "ltm_messages": []}
 
+        # Получаем ПОЛНЫЙ обновленный список сообщений из состояния.
+        # В нем содержится вся история, включая только что добавленные сообщения этого хода.
         all_messages: List[BaseMessage] = final_state_dict.get("messages", [])
         
+        # Находим последнее сообщение от AI для ответа пользователю.
         last_ai_message: Optional[AIMessage] = None
         for msg in reversed(all_messages):
-            if isinstance(msg, AIMessage):
+            if isinstance(msg, AIMessage) and msg.content: # Ищем сообщение с текстовым контентом
                 last_ai_message = msg
                 break
         
-        messages_for_ltm = []
-        try:
-            start_index = -1
-            for i in range(len(all_messages) - 1, -1, -1):
-                msg = all_messages[i]
-                if isinstance(msg, HumanMessage) and msg.content == input_message.content:
-                    start_index = i
-                    break
-            
-            if start_index != -1:
-                messages_for_ltm = all_messages[start_index:]
-                logger.debug(f"Identified {len(messages_for_ltm)} messages from this turn for potential LTM saving.")
-            else:
-                logger.warning("Could not find exact start of the turn in messages. LTM might miss this turn.")
-
-        except Exception as e:
-            logger.error(f"Error determining messages for LTM: {e}")
+        messages_for_ltm = all_messages
+        logger.debug(f"Returning full state with {len(messages_for_ltm)} messages for potential LTM processing.")
 
         result = {
             "response": "I'm sorry, I couldn't formulate a response.",
@@ -222,12 +209,9 @@ class LangGraphLLMEngine(LLMLogicEngineBase):
 
         if last_ai_message:
             logger.info(f"LLM response for thread_id='{thread_id}' successfully retrieved. Total messages in state: {len(all_messages)}.")
-            if return_full:
-                result["response"] = last_ai_message
-            else:
-                result["response"] = last_ai_message.content
+            result["response"] = last_ai_message if return_full else last_ai_message.content
         else:
-            logger.warning(f"No AIMessage found in the final state for thread_id='{thread_id}'.")
+            logger.warning(f"No AIMessage with content found in the final state for thread_id='{thread_id}'.")
 
         return result
 

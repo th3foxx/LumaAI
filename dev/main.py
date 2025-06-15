@@ -17,6 +17,7 @@ from app import globals as G
 # Project-specific service imports
 from connectivity import start_connectivity_monitoring, stop_connectivity_monitoring
 from services.reminder_checker import start_reminder_checker, stop_reminder_checker
+from services.proactive_service import start_proactive_service, stop_proactive_service
 from tools.scheduler import init_db as init_scheduler_db
 from utils.music_db import init_music_likes_table
 from tools.music_control import trigger_mpd_library_update
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
         if not settings.scheduler_db_path:
             logger.warning("Scheduler DB path not set. Reminder checker might not function correctly.")
         await start_reminder_checker(G.tts_engine, G.audio_output_engine)
+        await start_proactive_service()
     else:
         logger.warning("TTS or Audio Output engine not available/healthy, reminder checker not started.")
 
@@ -62,6 +64,7 @@ async def lifespan(app: FastAPI):
     logger.info("Lifespan: Shutdown phase beginning...")
     await stop_ltm_worker()
     await stop_reminder_checker()
+    await stop_proactive_service()
     await shutdown_global_engines()
     await stop_connectivity_monitoring()
     logger.info("Lifespan: Shutdown phase complete.")

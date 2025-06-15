@@ -3,7 +3,7 @@ import logging
 from collections import defaultdict
 from typing import Optional, Dict, List
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from mem0 import AsyncMemory
 
 from connectivity import is_internet_available
@@ -17,6 +17,30 @@ LTM_BUFFER_LOCK = asyncio.Lock()
 # Новый параметр: максимальный размер буфера на поток перед принудительной отправкой
 MAX_BUFFER_SIZE_PER_THREAD = 30
 
+def filter_messages_for_ltm(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """
+    Фильтрует список сообщений, оставляя только сообщения от пользователя для LTM.
+    Это сделано для того, чтобы в долговременной памяти сохранялась только
+    информация, напрямую сообщенная пользователем.
+    - Оставляет только HumanMessage.
+    - Удаляет AIMessage, ToolMessage и другие типы сообщений.
+    """
+    if not messages:
+        return []
+
+    # Оставляем в списке только экземпляры HumanMessage.
+    filtered_messages = [
+        msg for msg in messages if isinstance(msg, HumanMessage)
+    ]
+
+    # Логируем, сколько сообщений было отфильтровано, для отладки.
+    if messages:
+        logger.debug(
+            f"Filtering for LTM: Kept {len(filtered_messages)} HumanMessage(s) "
+            f"from an initial list of {len(messages)} message(s)."
+        )
+
+    return filtered_messages
 
 async def _save_thread_messages_to_ltm(mem0_client: AsyncMemory, thread_id: str, messages: List[BaseMessage]):
     """
@@ -27,18 +51,18 @@ async def _save_thread_messages_to_ltm(mem0_client: AsyncMemory, thread_id: str,
         return
 
     try:
-        role_map = {"human": "user", "ai": "assistant", "system": "system"}
+        # Теперь все сообщения гарантированно будут от пользователя.
         formatted_messages = [
-            {"role": role_map.get(msg.type), "content": msg.content}
+            {"role": "user", "content": msg.content}
             for msg in messages
-            if msg.type in role_map and msg.content
+            if msg.content  # Убедимся, что контент не пустой
         ]
 
         if not formatted_messages:
-            logger.warning(f"LTM Save: No messages to add for thread '{thread_id}' after formatting.")
+            logger.warning(f"LTM Save: No messages to add for thread '{thread_id}' after formatting (content might be empty).")
             return
 
-        logger.info(f"LTM Save: Saving {len(formatted_messages)} messages for thread '{thread_id}'.")
+        logger.info(f"LTM Save: Saving {len(formatted_messages)} user messages for thread '{thread_id}'.")
         await mem0_client.add(messages=formatted_messages, user_id=thread_id)
         logger.info(f"LTM Save: Successfully saved context for thread '{thread_id}'.")
 

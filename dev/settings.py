@@ -10,13 +10,43 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Engine Choice Enums (optional, but good for validation)
-# from enum import Enum
-# class STTEngineChoice(str, Enum):
-#     VOSK = "vosk"
-# class TTSEngineChoice(str, Enum):
-#     PAROLI = "paroli"
-# # ... and so on for other engine types
+
+def _load_system_prompt() -> str:
+    """Loads the system prompt from a file path or directly from an environment variable."""
+    default_prompt = "You are a helpful AI assistant."
+    prompt_path = os.getenv("AI_SYSTEM_PROMPT_PATH")
+    
+    if prompt_path:
+        try:
+            # Убедимся, что путь корректный относительно корня проекта
+            # Этот код предполагает, что settings.py находится в корне или подпапке
+            # и вы запускаете приложение из корня проекта.
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', prompt_path)
+            # Для более надежного определения корня, если структура сложная,
+            # можно использовать `os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))`
+            # но для вашей структуры это должно сработать.
+            # Простой вариант, если вы всегда запускаете из корня:
+            if not os.path.exists(prompt_path):
+                 logger.error(f"System prompt file not found at path specified in AI_SYSTEM_PROMPT_PATH: {prompt_path}")
+                 # Пробуем найти относительно файла settings.py
+                 script_dir_path = os.path.join(os.path.dirname(__file__), prompt_path)
+                 if os.path.exists(script_dir_path):
+                     prompt_path = script_dir_path
+                     logger.info(f"Found prompt file relative to settings.py: {prompt_path}")
+                 else:
+                     return os.getenv("AI_SYSTEM_PROMPT", default_prompt)
+
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                logger.info(f"Loading system prompt from file: {prompt_path}")
+                return f.read()
+        except Exception as e:
+            logger.error(f"Failed to load system prompt from file '{prompt_path}': {e}. Falling back to default or AI_SYSTEM_PROMPT variable.")
+            # Если файл не найден, пробуем прочитать переменную напрямую
+            return os.getenv("AI_SYSTEM_PROMPT", default_prompt)
+    
+    # Если путь не указан, читаем переменную как обычно
+    return os.getenv("AI_SYSTEM_PROMPT", default_prompt)
+
 
 @dataclass(frozen=True)
 class EngineSelectorSettings:
@@ -109,7 +139,7 @@ class GeminiTTSSettings:
 @dataclass(frozen=True)
 class ApplioTTSSettings:
     """Настройки Applio RVC TTS. https://github.com/IAHispano/Applio"""
-    api_url: str = os.getenv("APPLIO_API_URL", "http://31.181.77.165:5566/synthesize")
+    api_url: str = os.getenv("APPLIO_API_URL", "http://applio.vo1dy.tech:5566/synthesize")
     # Path to the .pth model file, accessible by the Applio server
     pth_path: Optional[str] = os.getenv("APPLIO_PTH_PATH")
     # Path to the .index file, accessible by the Applio server (can be null/None)
@@ -195,6 +225,14 @@ class Mem0Settings:
 
 
 @dataclass(frozen=True)
+class ProactiveSettings:
+    """Настройки для проактивного режима ассистента."""
+    # Устройство, которое будет проверяться для сценария "вечерний свет"
+    main_evening_light: str = os.getenv("PROACTIVE_MAIN_EVENING_LIGHT", "свет в лампа-зал")
+    # Можно добавить другие настройки в будущем, например, включение/выключение отдельных триггеров
+
+
+@dataclass(frozen=True)
 class AISettings: # For LLM/LangGraph (Online)
     embedding_model: str = os.getenv("EMBED_MODEL", "google_vertexai:text-multilingual-embedding-002")
     embedding_dims: int = int(os.getenv("EMBED_DIMS", 768))
@@ -203,7 +241,7 @@ class AISettings: # For LLM/LangGraph (Online)
     openai_api_base: str = os.getenv("OPENAI_API_BASE", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     history_length: int = int(os.getenv("AI_HISTORY_LENGTH", 10))
-    system_prompt: Optional[str] = os.getenv("AI_SYSTEM_PROMPT", "You are a helpful AI assistant.")
+    system_prompt: str = field(default_factory=_load_system_prompt, repr=False)
     online_mode: bool = os.getenv("AI_ONLINE_MODE", "True").lower() in ("true", "1", "t")
 
 
@@ -274,6 +312,7 @@ class ToolsSettings:
     weather_api_url: str = os.getenv("WEATHER_API_URL", "https://api.openweathermap.org/data/2.5/weather")
     serper_api_url: str = os.getenv("SERPER_API_URL", "https://google.serper.dev/search")
     serper_api_key: str = os.getenv("SERPER_API_KEY", "YOUR_SERPER_API_KEY_HERE")
+    default_weather_location: str = os.getenv("DEFAULT_WEATHER_LOCATION", "Ейск")
 
 
 @dataclass(frozen=True)
@@ -347,6 +386,7 @@ class Settings:
     smtp_mail: SMTPMailSettings = field(default_factory=SMTPMailSettings)
     contacts_config: ContactSettings = field(default_factory=ContactSettings)
     mem0: Mem0Settings = field(default_factory=Mem0Settings)
+    proactive: ProactiveSettings = field(default_factory=ProactiveSettings)
 
 
 settings = Settings()

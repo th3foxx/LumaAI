@@ -33,7 +33,10 @@ from engines.tts.hybrid_tts import HybridTTSEngine
 # App-specific imports for new modular structure
 from .config import settings
 from . import globals as G
-from .ltm_buffer import LTM_BUFFER_LOCK, LTM_MESSAGE_BUFFER, MAX_BUFFER_SIZE_PER_THREAD, _save_thread_messages_to_ltm
+from .ltm_buffer import (
+    LTM_BUFFER_LOCK, LTM_MESSAGE_BUFFER, MAX_BUFFER_SIZE_PER_THREAD, 
+    _save_thread_messages_to_ltm, filter_messages_for_ltm
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +252,28 @@ class ConnectionManager:
         if self.is_websocket_active:
             await self._send_json({"type": "error", "message": error_message})
     
+    async def initiate_proactive_dialogue(self, trigger_message: str):
+        """
+        Начинает диалог по инициативе ассистента, передавая системный триггер в LLM.
+        """
+        if self.state != "wakeword":
+            logger.warning(f"Cannot initiate proactive dialogue, manager is busy (state: {self.state}).")
+            return
+
+        logger.info(f"Initiating proactive dialogue with trigger: '{trigger_message}'")
+
+        # Мы немедленно запускаем LLM/TTS задачу, передавая ей триггер
+        # как первый "вопрос" от системы.
+        # _run_llm_tts_or_offline уже умеет обрабатывать это.
+        if self.llm_tts_task and not self.llm_tts_task.done():
+            self.llm_tts_task.cancel()
+        
+        # Запускаем основной цикл обработки, как будто "система" задала вопрос.
+        # Используем основной ID потока.
+        self.llm_tts_task = asyncio.create_task(
+            self._run_llm_tts_or_offline(trigger_message, G.ASSISTANT_THREAD_ID)
+        )
+    
     async def _run_llm_tts_or_offline(self, text: str, thread_id: str):
         response_text = ""
         tts_audio_bytes_for_local = bytearray()
@@ -270,26 +295,32 @@ class ConnectionManager:
                 try:
                     llm_result = await self.llm_logic_engine.ask(text, thread_id=thread_id)
                     _candidate_response = llm_result.get("response")
-                    messages_for_ltm = llm_result.get("ltm_messages", [])
+                    messages_for_ltm_raw = llm_result.get("ltm_messages", []) # Получаем "сырые" сообщения
 
+                    messages_for_ltm_clean = filter_messages_for_ltm(messages_for_ltm_raw)
+                    
+                    logger.debug(
+                        f"LTM Prep: Raw messages count: {len(messages_for_ltm_raw)}, "
+                        f"Clean messages count: {len(messages_for_ltm_clean)}"
+                    )
+                    
                     # Add messages to LTM buffer if internet and Mem0 are available
-                    if messages_for_ltm and G.mem0_client:
+                    if messages_for_ltm_clean and G.mem0_client: # <-- Используем очищенные сообщения
                         if online_capable:
                             async with LTM_BUFFER_LOCK:
-                                LTM_MESSAGE_BUFFER[thread_id].extend(messages_for_ltm)
-                                logger.debug(f"Added {len(messages_for_ltm)} messages to LTM buffer for thread '{thread_id}'.")
+                                LTM_MESSAGE_BUFFER[thread_id].extend(messages_for_ltm_clean) # <-- Добавляем очищенные
+                                logger.debug(f"Added {len(messages_for_ltm_clean)} clean messages to LTM buffer for thread '{thread_id}'.")
                                 
                                 if len(LTM_MESSAGE_BUFFER[thread_id]) >= MAX_BUFFER_SIZE_PER_THREAD:
                                     logger.info(f"LTM buffer for thread '{thread_id}' reached max size. Triggering immediate save.")
                                     messages_to_save_now = list(LTM_MESSAGE_BUFFER[thread_id])
                                     LTM_MESSAGE_BUFFER[thread_id].clear()
-                                    # Use G.mem0_client from globals
                                     asyncio.create_task(
                                         _save_thread_messages_to_ltm(G.mem0_client, thread_id, messages_to_save_now)
                                     )
                         else:
                             logger.info("Skipping adding messages to LTM buffer: no internet connection.")
-                    
+
                     if _candidate_response and not _candidate_response.startswith("Sorry, an error occurred"):
                         response_text = _candidate_response
                         online_llm_succeeded = True
@@ -329,6 +360,10 @@ class ConnectionManager:
                         if not response_text:
                             response_text = "I couldn't process this online, and no suitable offline action was found."
             
+            if response_text and response_text.strip() == "[DO_NOTHING]":
+                logger.info("LLM decided to do nothing based on the context. Aborting proactive dialogue.")
+                return
+
             if not response_text:
                 response_text = "I'm sorry, I was unable to process your request."
             
